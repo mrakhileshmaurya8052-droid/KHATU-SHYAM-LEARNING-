@@ -1,0 +1,6 @@
+{
+  "name": "KHATU SHYAM LEARNING",
+  "description": "Ultra-dark premium learning batch marketplace with instant QR checkout, admin approval workflow, AI thumbnail studio, and multi-mode batch launcher.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

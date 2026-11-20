@@ -1,0 +1,422 @@
+{
+  "entities": {
+    "SiteSettings": {
+      "title": "SiteSettings",
+      "description": "Global storefront branding, top pop-up banner, glow theme, and payment/QR configuration.",
+      "type": "object",
+      "properties": {
+        "brandName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Display brand name shown in top pop-up and header."
+        },
+        "showCheckmark": {
+          "type": "boolean",
+          "description": "Whether to display the verified checkmark beside the brand name."
+        },
+        "popupEnabled": {
+          "type": "boolean",
+          "description": "Whether the top pop-up bar is visible."
+        },
+        "popupText": {
+          "type": "string",
+          "maxLength": 240,
+          "description": "Top pop-up announcement text."
+        },
+        "popupCtaText": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Action button label in the top pop-up."
+        },
+        "heroTitle": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Main hero headline on the storefront."
+        },
+        "heroSubtitle": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Hero supporting subtitle."
+        },
+        "glowTheme": {
+          "type": "string",
+          "enum": ["amber", "crimson", "sapphire", "emerald"],
+          "description": "Active ultra-dark glow accent theme."
+        },
+        "upiId": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Merchant UPI ID for dynamic QR generation and direct payment."
+        },
+        "merchantName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Payee merchant display name."
+        },
+        "qrImageUrl": {
+          "type": "string",
+          "maxLength": 500000,
+          "description": "Custom uploaded QR code image data URL or empty string."
+        },
+        "bankDetails": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Optional bank transfer / IMPS / NEFT instructions."
+        },
+        "paymentInstructions": {
+          "type": "string",
+          "maxLength": 600,
+          "description": "Checkout instructions shown below the QR code."
+        },
+        "gatewayPaymentUrl": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Optional external payment gateway link."
+        },
+        "supportTelegramUrl": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Support Telegram link."
+        },
+        "supportWhatsapp": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Support WhatsApp number or link."
+        },
+        "supportedMethods": {
+          "type": "array",
+          "description": "Bounded list of enabled payment method identifiers (max 10)."
+        },
+        "customDomain": {
+          "type": "string",
+          "maxLength": 180,
+          "description": "Optional verified custom domain hostname allowed by anti-clone protection."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "brandName",
+        "showCheckmark",
+        "popupEnabled",
+        "popupText",
+        "popupCtaText",
+        "heroTitle",
+        "heroSubtitle",
+        "glowTheme",
+        "upiId",
+        "merchantName",
+        "qrImageUrl",
+        "bankDetails",
+        "paymentInstructions",
+        "gatewayPaymentUrl",
+        "supportTelegramUrl",
+        "supportWhatsapp",
+        "supportedMethods",
+        "updatedAt"
+      ]
+    },
+    "Batch": {
+      "title": "Batch",
+      "description": "Public batch catalog card with thumbnail sizing, pricing, and open type metadata.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "subtitle": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "instructor": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "price": {
+          "type": "number"
+        },
+        "originalPrice": {
+          "type": "number"
+        },
+        "thumbnailUrl": {
+          "type": "string",
+          "maxLength": 500000
+        },
+        "thumbnailSize": {
+          "type": "string",
+          "enum": ["compact", "standard", "large", "featured"]
+        },
+        "thumbnailAspect": {
+          "type": "string",
+          "enum": ["16:9", "4:3", "1:1", "3:4"]
+        },
+        "glowAccent": {
+          "type": "string",
+          "enum": ["amber", "crimson", "sapphire", "emerald"]
+        },
+        "openType": {
+          "type": "string",
+          "enum": ["webview", "website", "telegram", "telegram_bot"]
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "isFeatured": {
+          "type": "boolean"
+        },
+        "showCheckmark": {
+          "type": "boolean"
+        },
+        "requirePayment": {
+          "type": "boolean"
+        },
+        "displayOrder": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "title",
+        "subtitle",
+        "description",
+        "category",
+        "instructor",
+        "price",
+        "originalPrice",
+        "thumbnailUrl",
+        "thumbnailSize",
+        "thumbnailAspect",
+        "glowAccent",
+        "openType",
+        "isActive",
+        "isFeatured",
+        "displayOrder",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BatchSecret": {
+      "title": "BatchSecret",
+      "description": "Protected batch destination link and unlock instructions accessible only to admins.",
+      "type": "object",
+      "properties": {
+        "targetUrl": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "accessInstructions": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["targetUrl", "accessInstructions", "updatedAt"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Student payment submission and admin approval record.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userEmail": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "studentName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "studentPhone": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "batchId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "batchTitle": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "amount": {
+          "type": "number"
+        },
+        "paymentMethod": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "utrNumber": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "screenshotUrl": {
+          "type": "string",
+          "maxLength": 500000
+        },
+        "studentNote": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected"]
+        },
+        "adminNote": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "openType": {
+          "type": "string",
+          "enum": ["webview", "website", "telegram", "telegram_bot"]
+        },
+        "unlockedUrl": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "unlockedInstructions": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "userId",
+        "userEmail",
+        "studentName",
+        "studentPhone",
+        "batchId",
+        "batchTitle",
+        "amount",
+        "paymentMethod",
+        "utrNumber",
+        "screenshotUrl",
+        "studentNote",
+        "status",
+        "adminNote",
+        "openType",
+        "unlockedUrl",
+        "unlockedInstructions",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminMember": {
+      "title": "AdminMember",
+      "description": "Authorized admin registry document keyed by UID.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["email", "addedAt"]
+    },
+    "Offer": {
+      "title": "Offer",
+      "description": "Promotional Limited Offer banner item managed by Admin and displayed above Telegram Join card.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "badge": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "displayOrder": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "title",
+        "badge",
+        "description",
+        "isActive",
+        "displayOrder",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/site_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SiteSettings" },
+      "description": "Global storefront configuration document (id: global)."
+    },
+    "/batches/{batchId}": {
+      "schema": { "$ref": "#/entities/Batch" },
+      "description": "Publicly readable course batch catalog items."
+    },
+    "/batches/{batchId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/BatchSecret" },
+      "description": "Protected target URL and unlock instructions (id: access), admin-only."
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Student payment submissions and admin approval status."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminMember" },
+      "description": "Authorized admin UIDs."
+    },
+    "/offers/{offerId}": {
+      "schema": { "$ref": "#/entities/Offer" },
+      "description": "Publicly readable promotional offers created by Admin."
+    }
+  }
+}

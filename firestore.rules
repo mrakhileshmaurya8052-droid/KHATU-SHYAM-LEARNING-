@@ -1,0 +1,264 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidOrderId(id) {
+      return isValidId(id) && id.size() >= 32 && id.matches('^ord_[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'mrakhileshmaurya8052@gmail.com'
+        || exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidSiteSettings(data) {
+      return data.keys().hasAll([
+        'brandName', 'showCheckmark', 'popupEnabled', 'popupText', 'popupCtaText',
+        'heroTitle', 'heroSubtitle', 'glowTheme', 'upiId', 'merchantName',
+        'qrImageUrl', 'bankDetails', 'paymentInstructions', 'gatewayPaymentUrl',
+        'supportTelegramUrl', 'supportWhatsapp', 'supportedMethods', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'brandName', 'showCheckmark', 'popupEnabled', 'popupText', 'popupCtaText',
+        'heroTitle', 'heroSubtitle', 'glowTheme', 'upiId', 'merchantName',
+        'qrImageUrl', 'bankDetails', 'paymentInstructions', 'gatewayPaymentUrl',
+        'supportTelegramUrl', 'supportWhatsapp', 'supportedMethods', 'customDomain', 'updatedAt'
+      ])
+      && data.brandName is string && data.brandName.size() >= 1 && data.brandName.size() <= 100
+      && data.showCheckmark is bool
+      && data.popupEnabled is bool
+      && data.popupText is string && data.popupText.size() <= 240
+      && data.popupCtaText is string && data.popupCtaText.size() <= 60
+      && data.heroTitle is string && data.heroTitle.size() >= 1 && data.heroTitle.size() <= 160
+      && data.heroSubtitle is string && data.heroSubtitle.size() <= 400
+      && data.glowTheme in ['amber', 'crimson', 'sapphire', 'emerald']
+      && data.upiId is string && data.upiId.size() <= 120
+      && data.merchantName is string && data.merchantName.size() <= 100
+      && data.qrImageUrl is string && data.qrImageUrl.size() <= 500000
+      && data.bankDetails is string && data.bankDetails.size() <= 500
+      && data.paymentInstructions is string && data.paymentInstructions.size() <= 600
+      && data.gatewayPaymentUrl is string && data.gatewayPaymentUrl.size() <= 500
+      && data.supportTelegramUrl is string && data.supportTelegramUrl.size() <= 300
+      && data.supportWhatsapp is string && data.supportWhatsapp.size() <= 40
+      && data.supportedMethods is list && data.supportedMethods.size() <= 10
+      && (data.supportedMethods.size() == 0 || data.supportedMethods[0] is string)
+      && (!('customDomain' in data) || (data.customDomain is string && data.customDomain.size() <= 180))
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidBatch(data) {
+      return data.keys().hasAll([
+        'title', 'subtitle', 'description', 'category', 'instructor',
+        'price', 'originalPrice', 'thumbnailUrl', 'thumbnailSize',
+        'thumbnailAspect', 'glowAccent', 'openType', 'isActive',
+        'isFeatured', 'displayOrder', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'title', 'subtitle', 'description', 'category', 'instructor',
+        'price', 'originalPrice', 'thumbnailUrl', 'thumbnailSize',
+        'thumbnailAspect', 'glowAccent', 'openType', 'isActive',
+        'isFeatured', 'showCheckmark', 'requirePayment', 'displayOrder', 'createdAt', 'updatedAt'
+      ])
+      && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+      && data.subtitle is string && data.subtitle.size() <= 240
+      && data.description is string && data.description.size() <= 2000
+      && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+      && data.instructor is string && data.instructor.size() <= 80
+      && (data.price is int || data.price is float) && data.price >= 0 && data.price <= 1000000
+      && (data.originalPrice is int || data.originalPrice is float) && data.originalPrice >= 0 && data.originalPrice <= 1000000
+      && data.thumbnailUrl is string && data.thumbnailUrl.size() <= 500000
+      && data.thumbnailSize in ['compact', 'standard', 'large', 'featured']
+      && data.thumbnailAspect in ['16:9', '4:3', '1:1', '3:4']
+      && data.glowAccent in ['amber', 'crimson', 'sapphire', 'emerald']
+      && data.openType in ['webview', 'website', 'telegram', 'telegram_bot']
+      && data.isActive is bool
+      && data.isFeatured is bool
+      && (!('showCheckmark' in data) || data.showCheckmark is bool)
+      && (!('requirePayment' in data) || data.requirePayment is bool)
+      && (data.displayOrder is int || data.displayOrder is float) && data.displayOrder >= 0 && data.displayOrder <= 100000
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidBatchSecret(data) {
+      return data.keys().hasAll(['targetUrl', 'accessInstructions', 'updatedAt'])
+      && data.keys().hasOnly(['targetUrl', 'accessInstructions', 'updatedAt'])
+      && data.targetUrl is string && data.targetUrl.size() >= 1 && data.targetUrl.size() <= 1000
+      && data.accessInstructions is string && data.accessInstructions.size() <= 1000
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidOrder(data) {
+      return data.keys().hasAll([
+        'userId', 'userEmail', 'studentName', 'studentPhone', 'batchId',
+        'batchTitle', 'amount', 'paymentMethod', 'utrNumber', 'screenshotUrl',
+        'studentNote', 'status', 'adminNote', 'openType', 'unlockedUrl',
+        'unlockedInstructions', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'userId', 'userEmail', 'studentName', 'studentPhone', 'batchId',
+        'batchTitle', 'amount', 'paymentMethod', 'utrNumber', 'screenshotUrl',
+        'studentNote', 'status', 'adminNote', 'openType', 'unlockedUrl',
+        'unlockedInstructions', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.userId)
+      && data.userEmail is string && data.userEmail.size() <= 160
+      && data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 100
+      && data.studentPhone is string && data.studentPhone.size() >= 5 && data.studentPhone.size() <= 30
+      && isValidId(data.batchId)
+      && data.batchTitle is string && data.batchTitle.size() >= 1 && data.batchTitle.size() <= 140
+      && (data.amount is int || data.amount is float) && data.amount >= 0 && data.amount <= 1000000
+      && data.paymentMethod is string && data.paymentMethod.size() >= 1 && data.paymentMethod.size() <= 60
+      && data.utrNumber is string && data.utrNumber.size() >= 1 && data.utrNumber.size() <= 100
+      && data.screenshotUrl is string && data.screenshotUrl.size() <= 500000
+      && data.studentNote is string && data.studentNote.size() <= 500
+      && data.status in ['pending', 'approved', 'rejected']
+      && data.adminNote is string && data.adminNote.size() <= 500
+      && data.openType in ['webview', 'website', 'telegram', 'telegram_bot']
+      && data.unlockedUrl is string && data.unlockedUrl.size() <= 1000
+      && data.unlockedInstructions is string && data.unlockedInstructions.size() <= 1000
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidAdminMember(data) {
+      return data.keys().hasAll(['email', 'addedAt'])
+      && data.keys().hasOnly(['email', 'addedAt'])
+      && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+      && data.addedAt is timestamp;
+    }
+
+    function isValidOffer(data) {
+      return data.keys().hasAll([
+        'title', 'badge', 'description', 'isActive', 'displayOrder', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'title', 'badge', 'description', 'isActive', 'displayOrder', 'createdAt', 'updatedAt'
+      ])
+      && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+      && data.badge is string && data.badge.size() <= 40
+      && data.description is string && data.description.size() <= 300
+      && data.isActive is bool
+      && (data.displayOrder is int || data.displayOrder is float) && data.displayOrder >= 0 && data.displayOrder <= 100000
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    match /site_settings/{settingId} {
+      allow get: if isValidId(settingId) && settingId == 'global';
+      allow list: if false;
+      allow create: if isAdmin() && isValidId(settingId) && settingId == 'global'
+        && isValidSiteSettings(incoming()) && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(settingId) && settingId == 'global'
+        && isValidSiteSettings(incoming()) && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    match /batches/{batchId} {
+      allow get: if isValidId(batchId);
+      allow list: if true;
+      allow create: if isAdmin() && isValidId(batchId) && isValidBatch(incoming())
+        && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(batchId) && isValidBatch(incoming())
+        && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time;
+      allow delete: if isAdmin() && isValidId(batchId);
+
+      match /private/{docId} {
+        allow get: if isValidId(batchId) && isValidId(docId) && (
+          isAdmin() || (
+            docId == 'access'
+            && exists(/databases/$(database)/documents/batches/$(batchId))
+            && get(/databases/$(database)/documents/batches/$(batchId)).data.isActive == true
+            && (
+              get(/databases/$(database)/documents/batches/$(batchId)).data.price == 0
+              || (
+                'requirePayment' in get(/databases/$(database)/documents/batches/$(batchId)).data
+                && get(/databases/$(database)/documents/batches/$(batchId)).data.requirePayment == false
+              )
+            )
+          )
+        );
+        allow list: if false;
+        allow create: if isAdmin() && isValidId(batchId) && isValidId(docId) && docId == 'access'
+          && isValidBatchSecret(incoming()) && incoming().updatedAt == request.time;
+        allow update: if isAdmin() && isValidId(batchId) && isValidId(docId) && docId == 'access'
+          && isValidBatchSecret(incoming()) && incoming().updatedAt == request.time;
+        allow delete: if isAdmin() && isValidId(batchId) && isValidId(docId);
+      }
+    }
+
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && orderId.size() >= 24;
+      allow list: if isAdmin();
+      allow create: if isValidOrderId(orderId) && isValidOrder(incoming())
+        && incoming().status == 'pending'
+        && incoming().adminNote == ''
+        && incoming().unlockedUrl == ''
+        && incoming().unlockedInstructions == ''
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/batches/$(incoming().batchId))
+        && get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.isActive == true
+        && incoming().amount == get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.price
+        && incoming().batchTitle == get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.title;
+      allow update: if isAdmin() && isValidId(orderId) && isValidOrder(incoming())
+        && incoming().userId == existing().userId
+        && incoming().batchId == existing().batchId
+        && incoming().amount == existing().amount
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'adminNote', 'unlockedUrl', 'unlockedInstructions', 'openType', 'updatedAt'
+        ]);
+      allow delete: if isAdmin() && isValidId(orderId);
+    }
+
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && (isAdmin() || (isVerifiedUser() && request.auth.uid == adminUid));
+      allow list: if isAdmin();
+      allow create: if isAdmin() && isValidId(adminUid) && isValidAdminMember(incoming())
+        && incoming().addedAt == request.time;
+      allow update: if isAdmin() && isValidId(adminUid) && isValidAdminMember(incoming())
+        && incoming().addedAt == request.time;
+      allow delete: if isAdmin() && isValidId(adminUid);
+    }
+
+    match /offers/{offerId} {
+      allow get: if isValidId(offerId);
+      allow list: if true;
+      allow create: if isAdmin() && isValidId(offerId) && isValidOffer(incoming())
+        && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(offerId) && isValidOffer(incoming())
+        && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time;
+      allow delete: if isAdmin() && isValidId(offerId);
+    }
+  }
+}

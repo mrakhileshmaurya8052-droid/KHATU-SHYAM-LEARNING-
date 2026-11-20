@@ -1,0 +1,73 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-display: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: #030307;
+    color: #f8fafc;
+    scroll-behavior: smooth;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 16K HD Multi-Spectrum Ultra-Glow Light-Dark Surfaces */
+.hd-glass-surface {
+  background: linear-gradient(155deg, rgba(24, 26, 40, 0.92) 0%, rgba(7, 9, 16, 0.96) 100%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+    0 24px 64px -20px rgba(0, 0, 0, 0.95);
+}
+
+.ultra-glow-topbar {
+  background: linear-gradient(135deg, rgba(20, 12, 28, 0.94) 0%, rgba(8, 14, 22, 0.94) 55%, rgba(8, 22, 18, 0.94) 100%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.35),
+    0 0 36px -4px rgba(244, 114, 182, 0.55),
+    0 0 64px -8px rgba(74, 222, 128, 0.45);
+}
+
+.glow-card-amber {
+  box-shadow:
+    inset 0 1px 0 0 rgba(253, 224, 71, 0.32),
+    0 0 0 1px rgba(251, 191, 36, 0.5),
+    0 0 48px -10px rgba(245, 158, 11, 0.55),
+    0 0 80px -24px rgba(244, 114, 182, 0.3);
+}
+
+.glow-card-crimson {
+  box-shadow:
+    inset 0 1px 0 0 rgba(249, 168, 212, 0.4),
+    0 0 0 1px rgba(244, 114, 182, 0.6),
+    0 0 52px -8px rgba(236, 72, 153, 0.65),
+    0 0 80px -22px rgba(74, 222, 128, 0.3);
+}
+
+.glow-card-sapphire {
+  box-shadow:
+    inset 0 1px 0 0 rgba(125, 211, 252, 0.38),
+    0 0 0 1px rgba(56, 189, 248, 0.55),
+    0 0 52px -8px rgba(59, 130, 246, 0.6),
+    0 0 80px -22px rgba(244, 114, 182, 0.35);
+}
+
+.glow-card-emerald {
+  box-shadow:
+    inset 0 1px 0 0 rgba(134, 239, 172, 0.42),
+    0 0 0 1px rgba(74, 222, 128, 0.6),
+    0 0 52px -8px rgba(74, 222, 128, 0.62),
+    0 0 80px -22px rgba(56, 189, 248, 0.3);
+}
