@@ -33,7 +33,6 @@ import {
   QrCode,
   Settings,
   ShieldAlert,
-  Sparkles,
   Trash2,
   Users,
   Wand2,
@@ -53,10 +52,13 @@ import {
 import {
   BOOTSTRAPPED_ADMIN_EMAIL,
   db,
+  FIRESTORE_UPGRADE_URL,
   handleFirestoreError,
+  isQuotaExceededError,
+  logFirestoreError,
   OperationType,
 } from '../firebase';
-import { DEFAULT_SITE_SETTINGS, STARTER_BATCHES } from '../constants/defaults';
+import { DEFAULT_SITE_SETTINGS } from '../constants/defaults';
 import {
   compressImageFile,
   generateHdThumbnailDataUrl,
@@ -83,14 +85,19 @@ interface BatchFormState {
   isFeatured: boolean;
   showCheckmark: boolean;
   requirePayment: boolean;
+  plan1Label: string;
+  plan2Label: string;
+  plan2Price: string;
+  plan3Label: string;
+  plan3Price: string;
   displayOrder: string;
 }
 
 const EMPTY_BATCH_FORM: BatchFormState = {
   id: '',
   title: '',
-  price: '499',
-  originalPrice: '1499',
+  price: '49',
+  originalPrice: '199',
   thumbnailUrl: '',
   thumbnailSize: 'standard',
   thumbnailAspect: '16:9',
@@ -102,6 +109,11 @@ const EMPTY_BATCH_FORM: BatchFormState = {
   isFeatured: false,
   showCheckmark: true,
   requirePayment: true,
+  plan1Label: '1 Year',
+  plan2Label: '2 Years',
+  plan2Price: '59',
+  plan3Label: 'Lifetime',
+  plan3Price: '69',
   displayOrder: '1',
 };
 
@@ -110,6 +122,8 @@ export function AdminPanel({
   settings,
   batches,
   offers,
+  quotaExceeded = false,
+  onSyncCatalog,
   onSignIn,
   onSignOut,
   onBackToStorefront,
@@ -118,6 +132,12 @@ export function AdminPanel({
   settings: SiteSettings;
   batches: Batch[];
   offers: Offer[];
+  quotaExceeded?: boolean;
+  onSyncCatalog?: (payload: {
+    settings?: Partial<SiteSettings> | null;
+    batches?: Batch[];
+    offers?: Offer[];
+  }) => void;
   onSignIn: () => Promise<void>;
   onSignOut: () => Promise<void>;
   onBackToStorefront: () => void;
@@ -173,6 +193,7 @@ export function AdminPanel({
   const [settingsForm, setSettingsForm] = useState<SiteSettings>(settings);
   const [savingSettings, setSavingSettings] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [copiedStorefrontLink, setCopiedStorefrontLink] = useState(false);
   const [copiedCustomType, setCopiedCustomType] = useState<'storefront' | 'admin' | null>(null);
   const [checkingDns, setCheckingDns] = useState(false);
   const [dnsError, setDnsError] = useState('');
@@ -183,7 +204,7 @@ export function AdminPanel({
     pointsToGoogleHost: boolean;
     connected: boolean;
   } | null>(null);
-  const [seeding, setSeeding] = useState(false);
+  const [connectingDb, setConnectingDb] = useState(false);
 
   useEffect(() => {
     setSettingsForm(settings);
@@ -235,6 +256,12 @@ export function AdminPanel({
         setAllOrders(list);
       },
       (err) => {
+        if (isQuotaExceededError(err)) {
+          setErrorMessage(
+            'Firestore daily free read quota is exceeded right now. Pending orders will load again after reset or upgrade.',
+          );
+          return;
+        }
         handleFirestoreError(err, OperationType.LIST, 'orders');
       },
     );
@@ -245,6 +272,9 @@ export function AdminPanel({
     typeof window !== 'undefined'
       ? `${window.location.origin}/ksl-admin-872`
       : '/ksl-admin-872';
+
+  const storefrontShareUrl =
+    typeof window !== 'undefined' ? `${window.location.origin}/` : '/';
 
   // Verify server-issued HMAC admin session on mount so DevTools sessionStorage tampering cannot unlock the panel
   useEffect(() => {
@@ -320,46 +350,53 @@ export function AdminPanel({
   const showToast = (msg: string) => {
     setStatusMessage(msg);
     setErrorMessage('');
-    setTimeout(() => setStatusMessage(''), 3500);
+    setTimeout(() => setStatusMessage(''), 4000);
+  };
+
+  const handleConnectDb = async () => {
+    setErrorMessage('');
+    setConnectingDb(true);
+    try {
+      await onSignIn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Google sign-in could not be completed.';
+      if (msg.includes('popup-closed-by-user')) {
+        setErrorMessage('Sign-in popup was closed. Please complete Google sign-in to sync database.');
+      } else {
+        setErrorMessage(msg);
+      }
+    } finally {
+      setConnectingDb(false);
+    }
   };
 
   const ensureDbWriteAccess = (): boolean => {
     if (user && isDbAdmin) return true;
     setErrorMessage(
-      `Database sync requires one-time verification with ${BOOTSTRAPPED_ADMIN_EMAIL}. Click "Connect Database Sync" above.`,
+      `Database sync required! Tap "Connect Database Sync" (${BOOTSTRAPPED_ADMIN_EMAIL}) first, then tap Publish.`,
     );
     return false;
   };
 
-  const handleSeedStarterData = async () => {
-    if (!ensureDbWriteAccess()) return;
-    setSeeding(true);
-    setErrorMessage('');
+  const pushCatalogSnapshot = async (next: {
+    settings?: SiteSettings;
+    batches?: Batch[];
+    offers?: Offer[];
+  }) => {
+    onSyncCatalog?.(next);
     try {
-      const batchWrite = writeBatch(db);
-      batchWrite.set(doc(db, 'site_settings', 'global'), {
-        ...DEFAULT_SITE_SETTINGS,
-        updatedAt: serverTimestamp(),
+      await fetch('/api/admin/catalog-snapshot', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-KSL-Client': 'ksl-v1',
+          ...(adminToken ? { 'X-Admin-Session': adminToken } : {}),
+        },
+        body: JSON.stringify(next),
       });
-      for (const item of STARTER_BATCHES) {
-        const { id, targetUrl, accessInstructions, ...publicFields } = item;
-        batchWrite.set(doc(db, 'batches', id), {
-          ...publicFields,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        batchWrite.set(doc(db, 'batches', id, 'private', 'access'), {
-          targetUrl,
-          accessInstructions,
-          updatedAt: serverTimestamp(),
-        });
-      }
-      await batchWrite.commit();
-      showToast('Starter batches & settings loaded into Firestore.');
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'batches');
-    } finally {
-      setSeeding(false);
+    } catch {
+      // Ignore if running on static host without /api backend
     }
   };
 
@@ -367,7 +404,7 @@ export function AdminPanel({
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const compressed = await compressImageFile(file, 1280, 0.84);
+      const compressed = await compressImageFile(file, 800, 0.78);
       setBatchForm((prev) => ({ ...prev, thumbnailUrl: compressed }));
       showToast('Thumbnail uploaded & optimized.');
     } catch (err) {
@@ -444,7 +481,9 @@ export function AdminPanel({
           accessInstructions = String(d.accessInstructions || '');
         }
       } catch (err) {
-        handleFirestoreError(err, OperationType.GET, `batches/${batch.id}/private/access`);
+        setErrorMessage(
+          logFirestoreError(err, OperationType.GET, `batches/${batch.id}/private/access`),
+        );
       }
     } else {
       ensureDbWriteAccess();
@@ -466,6 +505,17 @@ export function AdminPanel({
       isFeatured: batch.isFeatured,
       showCheckmark: batch.showCheckmark !== false,
       requirePayment: batch.requirePayment !== false && batch.price > 0,
+      plan1Label: batch.plan1Label || '1 Year',
+      plan2Label: batch.plan2Label || '2 Years',
+      plan2Price:
+        typeof batch.plan2Price === 'number'
+          ? String(batch.plan2Price)
+          : String((Number(batch.price) || 0) + 10),
+      plan3Label: batch.plan3Label || 'Lifetime',
+      plan3Price:
+        typeof batch.plan3Price === 'number'
+          ? String(batch.plan3Price)
+          : String((Number(batch.price) || 0) + 20),
       displayOrder: String(batch.displayOrder),
     });
   };
@@ -474,19 +524,30 @@ export function AdminPanel({
     e.preventDefault();
     setErrorMessage('');
 
-    if (!batchForm.title.trim()) {
+    const trimmedTitle = batchForm.title.trim();
+    const trimmedTargetUrl = batchForm.targetUrl.trim();
+
+    if (!trimmedTitle) {
       setErrorMessage('Batch Name is required.');
       return;
     }
-    if (!batchForm.targetUrl.trim()) {
+    if (!trimmedTargetUrl) {
       setErrorMessage('Target URL (WebView / Website / Telegram link) is required.');
+      return;
+    }
+    if (!/^https?:\/\//i.test(trimmedTargetUrl)) {
+      setErrorMessage('Target URL must start with https:// or http://');
+      return;
+    }
+    if (batchForm.thumbnailUrl.length > 495000) {
+      setErrorMessage('Thumbnail image is too large. Please re-upload a smaller image or click Generate Thumbnail.');
       return;
     }
     if (!ensureDbWriteAccess()) return;
 
     const batchId =
       editingId ||
-      `batch_${batchForm.title
+      `batch_${trimmedTitle
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .replace(/^_|_$/g, '')
@@ -504,16 +565,23 @@ export function AdminPanel({
         ? Math.max(0, Number(batchForm.price) || 0)
         : 0;
       const finalRequirePayment = batchForm.requirePayment && numericPrice > 0;
+      const numericPlan2Price = finalRequirePayment
+        ? Math.max(0, Number(batchForm.plan2Price) || numericPrice + 10)
+        : 0;
+      const numericPlan3Price = finalRequirePayment
+        ? Math.max(0, Number(batchForm.plan3Price) || numericPrice + 20)
+        : 0;
 
-      bw.set(batchRef, {
-        title: batchForm.title.trim().slice(0, 140),
+      const nextBatchPayload: Batch = {
+        id: batchId,
+        title: trimmedTitle.slice(0, 140),
         subtitle: '',
         description: '',
         category: 'Batch',
         instructor: '',
         price: numericPrice,
         originalPrice: Math.max(0, Number(batchForm.originalPrice) || 0),
-        thumbnailUrl: batchForm.thumbnailUrl.slice(0, 500000),
+        thumbnailUrl: batchForm.thumbnailUrl,
         thumbnailSize: batchForm.thumbnailSize,
         thumbnailAspect: batchForm.thumbnailAspect,
         glowAccent: batchForm.glowAccent,
@@ -522,23 +590,57 @@ export function AdminPanel({
         isFeatured: batchForm.isFeatured,
         showCheckmark: batchForm.showCheckmark,
         requirePayment: finalRequirePayment,
+        plan1Label: (batchForm.plan1Label.trim() || '1 Year').slice(0, 40),
+        plan2Label: (batchForm.plan2Label.trim() || '2 Years').slice(0, 40),
+        plan2Price: numericPlan2Price,
+        plan3Label: (batchForm.plan3Label.trim() || 'Lifetime').slice(0, 40),
+        plan3Price: numericPlan3Price,
         displayOrder: Math.max(0, Number(batchForm.displayOrder) || 1),
+      };
+
+      bw.set(batchRef, {
+        title: nextBatchPayload.title,
+        subtitle: nextBatchPayload.subtitle,
+        description: nextBatchPayload.description,
+        category: nextBatchPayload.category,
+        instructor: nextBatchPayload.instructor,
+        price: nextBatchPayload.price,
+        originalPrice: nextBatchPayload.originalPrice,
+        thumbnailUrl: nextBatchPayload.thumbnailUrl,
+        thumbnailSize: nextBatchPayload.thumbnailSize,
+        thumbnailAspect: nextBatchPayload.thumbnailAspect,
+        glowAccent: nextBatchPayload.glowAccent,
+        openType: nextBatchPayload.openType,
+        isActive: nextBatchPayload.isActive,
+        isFeatured: nextBatchPayload.isFeatured,
+        showCheckmark: nextBatchPayload.showCheckmark,
+        requirePayment: nextBatchPayload.requirePayment,
+        plan1Label: nextBatchPayload.plan1Label,
+        plan2Label: nextBatchPayload.plan2Label,
+        plan2Price: nextBatchPayload.plan2Price,
+        plan3Label: nextBatchPayload.plan3Label,
+        plan3Price: nextBatchPayload.plan3Price,
+        displayOrder: nextBatchPayload.displayOrder,
         createdAt: existingBatch?.createdAt || serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
       bw.set(secretRef, {
-        targetUrl: batchForm.targetUrl.trim().slice(0, 1000),
+        targetUrl: trimmedTargetUrl.slice(0, 1000),
         accessInstructions: batchForm.accessInstructions.trim().slice(0, 1000),
         updatedAt: serverTimestamp(),
       });
 
       await bw.commit();
+      const updatedBatches = existingBatch
+        ? batches.map((b) => (b.id === batchId ? nextBatchPayload : b))
+        : [...batches, nextBatchPayload];
+      void pushCatalogSnapshot({ batches: updatedBatches, offers, settings });
       setBatchForm(EMPTY_BATCH_FORM);
       setEditingId(null);
-      showToast(editingId ? 'Batch updated successfully.' : 'New batch published.');
+      showToast(editingId ? 'Batch updated successfully!' : 'Batch published to website successfully!');
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `batches/${batchId}`);
+      setErrorMessage(logFirestoreError(err, OperationType.WRITE, `batches/${batchId}`));
     } finally {
       setSavingBatch(false);
     }
@@ -549,13 +651,15 @@ export function AdminPanel({
     try {
       await deleteDoc(doc(db, 'batches', batchId, 'private', 'access'));
       await deleteDoc(doc(db, 'batches', batchId));
+      const updatedBatches = batches.filter((b) => b.id !== batchId);
+      void pushCatalogSnapshot({ batches: updatedBatches, offers, settings });
       if (editingId === batchId) {
         setEditingId(null);
         setBatchForm(EMPTY_BATCH_FORM);
       }
       showToast('Batch deleted.');
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `batches/${batchId}`);
+      setErrorMessage(logFirestoreError(err, OperationType.DELETE, `batches/${batchId}`));
     }
   };
 
@@ -573,15 +677,27 @@ export function AdminPanel({
     setSavingOffer(true);
     try {
       const existingOffer = offers.find((o) => o.id === offerId);
-      await setDoc(doc(db, 'offers', offerId), {
+      const nextOffer: Offer = {
+        id: offerId,
         title: offerForm.title.trim().slice(0, 120),
         badge: offerForm.badge.trim().slice(0, 40),
         description: offerForm.description.trim().slice(0, 300),
         isActive: offerForm.isActive,
         displayOrder: Math.max(0, Number(offerForm.displayOrder) || 1),
+      };
+      await setDoc(doc(db, 'offers', offerId), {
+        title: nextOffer.title,
+        badge: nextOffer.badge,
+        description: nextOffer.description,
+        isActive: nextOffer.isActive,
+        displayOrder: nextOffer.displayOrder,
         createdAt: existingOffer?.createdAt || serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+      const updatedOffers = existingOffer
+        ? offers.map((o) => (o.id === offerId ? nextOffer : o))
+        : [...offers, nextOffer];
+      void pushCatalogSnapshot({ batches, offers: updatedOffers, settings });
       setOfferForm({
         title: '',
         badge: 'LIMITED',
@@ -592,7 +708,7 @@ export function AdminPanel({
       setEditingOfferId(null);
       showToast(editingOfferId ? 'Offer updated.' : 'Limited Offer published to Storefront.');
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `offers/${offerId}`);
+      setErrorMessage(logFirestoreError(err, OperationType.WRITE, `offers/${offerId}`));
     } finally {
       setSavingOffer(false);
     }
@@ -602,6 +718,8 @@ export function AdminPanel({
     if (!ensureDbWriteAccess()) return;
     try {
       await deleteDoc(doc(db, 'offers', offerId));
+      const updatedOffers = offers.filter((o) => o.id !== offerId);
+      void pushCatalogSnapshot({ batches, offers: updatedOffers, settings });
       if (editingOfferId === offerId) {
         setEditingOfferId(null);
         setOfferForm({
@@ -614,7 +732,7 @@ export function AdminPanel({
       }
       showToast('Offer deleted.');
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `offers/${offerId}`);
+      setErrorMessage(logFirestoreError(err, OperationType.DELETE, `offers/${offerId}`));
     }
   };
 
@@ -645,7 +763,7 @@ export function AdminPanel({
       );
       showToast(`Approved ${order.studentName} for ${order.batchTitle}`);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`);
+      setErrorMessage(logFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`));
     }
   };
 
@@ -667,7 +785,7 @@ export function AdminPanel({
       );
       showToast(`Declined order from ${order.studentName}`);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`);
+      setErrorMessage(logFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`));
     }
   };
 
@@ -720,8 +838,13 @@ export function AdminPanel({
       setSavingSettings(false);
       return;
     }
+    if (settingsForm.qrImageUrl.length > 495000) {
+      setErrorMessage('Custom QR image is too large. Please upload a smaller image.');
+      setSavingSettings(false);
+      return;
+    }
     try {
-      await setDoc(doc(db, 'site_settings', 'global'), {
+      const savedSettings: SiteSettings = {
         brandName: (settingsForm.brandName.trim() || 'KHATU SHYAM LEARNING').slice(0, 100),
         showCheckmark: Boolean(settingsForm.showCheckmark),
         popupEnabled: Boolean(settingsForm.popupEnabled),
@@ -732,7 +855,7 @@ export function AdminPanel({
         glowTheme: settingsForm.glowTheme,
         upiId: settingsForm.upiId.trim().slice(0, 120),
         merchantName: settingsForm.merchantName.trim().slice(0, 100),
-        qrImageUrl: settingsForm.qrImageUrl.slice(0, 500000),
+        qrImageUrl: settingsForm.qrImageUrl,
         bankDetails: settingsForm.bankDetails.trim().slice(0, 500),
         paymentInstructions: settingsForm.paymentInstructions.trim().slice(0, 600),
         gatewayPaymentUrl: settingsForm.gatewayPaymentUrl.trim().slice(0, 500),
@@ -740,12 +863,16 @@ export function AdminPanel({
         supportWhatsapp: settingsForm.supportWhatsapp.trim().slice(0, 40),
         supportedMethods: settingsForm.supportedMethods.slice(0, 10),
         customDomain: normalizedCustomDomain.slice(0, 180),
+      };
+      await setDoc(doc(db, 'site_settings', 'global'), {
+        ...savedSettings,
         updatedAt: serverTimestamp(),
       });
       setSettingsForm((prev) => ({ ...prev, customDomain: normalizedCustomDomain }));
+      void pushCatalogSnapshot({ batches, offers, settings: savedSettings });
       showToast('Storefront, custom domain & payment settings saved.');
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'site_settings/global');
+      setErrorMessage(logFirestoreError(err, OperationType.WRITE, 'site_settings/global'));
     } finally {
       setSavingSettings(false);
     }
@@ -1015,17 +1142,14 @@ export function AdminPanel({
           </div>
 
           <div className="flex items-center gap-3">
-            {batches.length === 0 && (
-              <button
-                type="button"
-                disabled={seeding}
-                onClick={() => void handleSeedStarterData()}
-                className={glowPrimaryBtnClass}
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                {seeding ? 'Loading...' : 'Load Starter Batches'}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setActiveTab('batches')}
+              className={glowPrimaryBtnClass}
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add Batch ({batches.length})
+            </button>
           </div>
         </div>
 
@@ -1054,13 +1178,34 @@ export function AdminPanel({
               )}
               <button
                 type="button"
-                onClick={() => void onSignIn()}
+                disabled={connectingDb}
+                onClick={() => void handleConnectDb()}
                 className={glowPrimaryBtnClass}
               >
                 <LogIn className="w-3.5 h-3.5" />
-                Connect Database Sync
+                {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
               </button>
             </div>
+          </div>
+        )}
+
+        {quotaExceeded && (
+          <div className="relative p-4 rounded-2xl hd-glass-surface border border-rose-400/60 shadow-[0_0_32px_-8px_rgba(244,63,94,0.5)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 overflow-hidden">
+            <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-rose-400 via-amber-300 to-pink-400" />
+            <div className="flex items-start gap-2.5 text-xs font-medium text-rose-100 leading-relaxed">
+              <ShieldAlert className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" />
+              <span>
+                <strong>Firestore Free Daily Read Quota Exceeded:</strong> Google Cloud Firestore has hit today&apos;s free read-unit limit (resets tomorrow; see Spark plan details under Enterprise edition at firebase.google.com/pricing#cloud-firestore). Cached batches remain visible on Storefront, or upgrade your Firebase database plan below.
+              </span>
+            </div>
+            <a
+              href={FIRESTORE_UPGRADE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-amber-300 to-pink-400 text-zinc-950 text-xs font-extrabold whitespace-nowrap shrink-0"
+            >
+              Upgrade Firestore Plan
+            </a>
           </div>
         )}
 
@@ -1140,7 +1285,8 @@ export function AdminPanel({
                         <div className="text-xs space-y-0.5">
                           <p className="font-bold text-white">
                             {ord.studentName} ·{' '}
-                            <span className="text-lime-300 font-mono">₹{ord.amount}</span> ({ord.batchTitle})
+                            <span className="text-lime-300 font-mono">₹{ord.amount}</span>{' '}
+                            {ord.planLabel ? `(${ord.batchTitle} · ${ord.planLabel})` : `(${ord.batchTitle})`}
                           </p>
                           <p className="font-mono text-cyan-200/90">
                             UTR: {ord.utrNumber} · {ord.studentPhone}
@@ -1261,10 +1407,16 @@ export function AdminPanel({
                       value={batchForm.requirePayment ? batchForm.price : '0'}
                       onChange={(e) => {
                         const val = e.target.value;
+                        const prevBase = Number(batchForm.price) || 0;
+                        const nextBase = Number(val) || 0;
+                        const keepAuto2 = Number(batchForm.plan2Price) === prevBase + 10;
+                        const keepAuto3 = Number(batchForm.plan3Price) === prevBase + 20;
                         setBatchForm({
                           ...batchForm,
                           price: val,
                           requirePayment: Number(val) > 0,
+                          plan2Price: keepAuto2 ? String(nextBase + 10) : batchForm.plan2Price,
+                          plan3Price: keepAuto3 ? String(nextBase + 20) : batchForm.plan3Price,
                         });
                       }}
                       className={`${glowInputClass} font-mono disabled:opacity-60`}
@@ -1291,6 +1443,85 @@ export function AdminPanel({
                     />
                   </div>
                 </div>
+
+                {batchForm.requirePayment && (
+                  <div className="p-3.5 rounded-2xl bg-[#060810]/90 border border-pink-400/35 space-y-3">
+                    <p className="text-xs font-extrabold text-pink-200">
+                      3-Plan Popup Pricing (Plan 1 Popular uses Sale Price ₹{batchForm.price || 0})
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-semibold text-amber-200">
+                          Plan 1 (Most Popular)
+                        </label>
+                        <input
+                          type="text"
+                          maxLength={40}
+                          value={batchForm.plan1Label}
+                          onChange={(e) =>
+                            setBatchForm({ ...batchForm, plan1Label: e.target.value })
+                          }
+                          placeholder="1 Year"
+                          className={glowCompactInputClass}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-semibold text-cyan-200">
+                          Plan 2 Label &amp; Price (₹)
+                        </label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            maxLength={40}
+                            value={batchForm.plan2Label}
+                            onChange={(e) =>
+                              setBatchForm({ ...batchForm, plan2Label: e.target.value })
+                            }
+                            placeholder="2 Years"
+                            className={glowCompactInputClass}
+                          />
+                          <input
+                            type="number"
+                            min={0}
+                            value={batchForm.plan2Price}
+                            onChange={(e) =>
+                              setBatchForm({ ...batchForm, plan2Price: e.target.value })
+                            }
+                            placeholder="59"
+                            className={`${glowCompactInputClass} w-20 font-mono`}
+                          />
+                        </div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] font-semibold text-lime-200">
+                          Plan 3 Label &amp; Price (₹)
+                        </label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            maxLength={40}
+                            value={batchForm.plan3Label}
+                            onChange={(e) =>
+                              setBatchForm({ ...batchForm, plan3Label: e.target.value })
+                            }
+                            placeholder="Lifetime"
+                            className={glowCompactInputClass}
+                          />
+                          <input
+                            type="number"
+                            min={0}
+                            value={batchForm.plan3Price}
+                            onChange={(e) =>
+                              setBatchForm({ ...batchForm, plan3Price: e.target.value })
+                            }
+                            placeholder="69"
+                            className={`${glowCompactInputClass} w-20 font-mono`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Thumbnail Size, Aspect & Glow Controls */}
@@ -1471,6 +1702,36 @@ export function AdminPanel({
                 </div>
               </div>
 
+              {!isDbAdmin && (
+                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-100">
+                  <span>
+                    Batch save karne ke liye ek baar <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> se Database Sync connect karein.
+                  </span>
+                  <button
+                    type="button"
+                    disabled={connectingDb}
+                    onClick={() => void handleConnectDb()}
+                    className={glowPrimaryBtnClass}
+                  >
+                    <LogIn className="w-3.5 h-3.5" />
+                    {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
+                  </button>
+                </div>
+              )}
+
+              {errorMessage && (
+                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-400/60 text-xs font-semibold text-rose-200 flex items-center gap-2">
+                  <XCircle className="w-4 h-4 text-rose-300 shrink-0" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+              {statusMessage && (
+                <div className="p-3 rounded-xl bg-lime-400/15 border border-lime-300/60 text-xs font-semibold text-lime-200 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
+                  <span>{statusMessage}</span>
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
                 <div className="flex items-center gap-5 text-xs font-semibold text-zinc-200">
                   <label className="inline-flex items-center gap-2 cursor-pointer">
@@ -1511,7 +1772,7 @@ export function AdminPanel({
               </h2>
               {batches.length === 0 ? (
                 <div className="p-6 rounded-2xl hd-glass-surface border border-pink-300/30 text-xs text-zinc-300">
-                  No batches yet. Add one on the left or click Load Starter Batches above.
+                  No batches added yet. Fill out the form on the left and tap Publish Batch.
                 </div>
               ) : (
                 [...batches]
@@ -1519,7 +1780,7 @@ export function AdminPanel({
                     const aDirect = a.requirePayment === false || a.price === 0 ? 0 : 1;
                     const bDirect = b.requirePayment === false || b.price === 0 ? 0 : 1;
                     if (aDirect !== bDirect) return aDirect - bDirect;
-                    return a.displayOrder - b.displayOrder;
+                    return (Number(a.displayOrder) || 0) - (Number(b.displayOrder) || 0);
                   })
                   .map((b) => (
                   <div
@@ -1527,11 +1788,17 @@ export function AdminPanel({
                     className="p-4 rounded-2xl hd-glass-surface border border-pink-300/35 hover:border-lime-300/65 shadow-[0_0_30px_-12px_rgba(244,114,182,0.4)] flex items-center justify-between gap-4 transition-all"
                   >
                     <div className="flex items-center gap-3 min-w-0">
-                      <img
-                        src={b.thumbnailUrl}
-                        alt={b.title}
-                        className="w-16 h-11 rounded-lg object-cover border border-white/20 shrink-0 bg-black"
-                      />
+                      {b.thumbnailUrl ? (
+                        <img
+                          src={b.thumbnailUrl}
+                          alt={b.title}
+                          className="w-16 h-11 rounded-lg object-cover border border-white/20 shrink-0 bg-black"
+                        />
+                      ) : (
+                        <div className="w-16 h-11 rounded-lg border border-pink-300/30 shrink-0 bg-gradient-to-br from-[#1C1229] to-[#081C15] flex items-center justify-center">
+                          <Layers className="w-4 h-4 text-pink-300" />
+                        </div>
+                      )}
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <p className="text-xs font-bold text-white truncate">{b.title}</p>
@@ -1656,6 +1923,21 @@ export function AdminPanel({
                     className={glowInputClass}
                   />
                 </div>
+
+                {!isDbAdmin && (
+                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-100">
+                    <span>Connect <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> to save offers.</span>
+                    <button
+                      type="button"
+                      disabled={connectingDb}
+                      onClick={() => void handleConnectDb()}
+                      className={glowPrimaryBtnClass}
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                      {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
+                    </button>
+                  </div>
+                )}
 
                 <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
                   <div className="flex items-center gap-5 text-xs font-semibold text-zinc-200">
@@ -1885,6 +2167,7 @@ export function AdminPanel({
                         </div>
                         <h3 className="text-sm font-extrabold text-white">
                           {ord.studentName} — {ord.batchTitle}
+                          {ord.planLabel ? ` (${ord.planLabel})` : ''}
                         </h3>
                         <p className="text-xs font-mono text-zinc-300">
                           Phone: {ord.studentPhone} · Email: {ord.userEmail || 'N/A'} · UTR: {ord.utrNumber}
@@ -2047,6 +2330,34 @@ export function AdminPanel({
                 />
               </div>
 
+              {!isDbAdmin && (
+                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-100">
+                  <span>Connect <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> to save payment settings.</span>
+                  <button
+                    type="button"
+                    disabled={connectingDb}
+                    onClick={() => void handleConnectDb()}
+                    className={glowPrimaryBtnClass}
+                  >
+                    <LogIn className="w-3.5 h-3.5" />
+                    {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
+                  </button>
+                </div>
+              )}
+
+              {errorMessage && (
+                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-400/60 text-xs font-semibold text-rose-200 flex items-center gap-2">
+                  <XCircle className="w-4 h-4 text-rose-300 shrink-0" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+              {statusMessage && (
+                <div className="p-3 rounded-xl bg-lime-400/15 border border-lime-300/60 text-xs font-semibold text-lime-200 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
+                  <span>{statusMessage}</span>
+                </div>
+              )}
+
               <button
                 type="submit"
                 disabled={savingSettings}
@@ -2124,6 +2435,41 @@ export function AdminPanel({
               >
                 {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 {copiedLink ? 'Copied' : 'Copy Admin Link'}
+              </button>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-gradient-to-r from-cyan-500/15 via-[#090D16] to-pink-500/15 border border-cyan-300/45 shadow-[0_0_28px_-10px_rgba(56,189,248,0.45)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs font-extrabold text-cyan-200">
+                  App, Store &amp; WebView Link (Browser + WebView Supported)
+                </p>
+                <p className="text-xs font-mono text-white mt-0.5 break-all">{storefrontShareUrl}</p>
+                <p className="text-[11px] text-zinc-300 mt-1">
+                  Anyone can add this link inside their app, store, Android/iOS WebView, or browser — direct external API connections remain strictly blocked.
+                </p>
+                {typeof window !== 'undefined' &&
+                  (window.location.hostname.startsWith('ais-dev-') ||
+                    window.location.hostname.startsWith('ais-pre-')) && (
+                    <p className="text-[11px] font-semibold text-amber-300 mt-1">
+                      Preview URL Note: External apps ke liye AI Studio me Deploy karne ke baad milne wala Public Cloud Run URL ya apna Custom Domain (e.g. https://{normalizeCustomDomain(settings.customDomain) || 'khatushyamlearning.vercel.app'}/) add karein.
+                    </p>
+                  )}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard.writeText(storefrontShareUrl);
+                  setCopiedStorefrontLink(true);
+                  setTimeout(() => setCopiedStorefrontLink(false), 1800);
+                }}
+                className={glowPrimaryBtnClass}
+              >
+                {copiedStorefrontLink ? (
+                  <Check className="w-3.5 h-3.5" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+                {copiedStorefrontLink ? 'Copied' : 'Copy App Link'}
               </button>
             </div>
 
@@ -2416,6 +2762,34 @@ export function AdminPanel({
                 />
               </div>
             </div>
+
+            {!isDbAdmin && (
+              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-100">
+                <span>Connect <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> to save storefront settings.</span>
+                <button
+                  type="button"
+                  disabled={connectingDb}
+                  onClick={() => void handleConnectDb()}
+                  className={glowPrimaryBtnClass}
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
+                </button>
+              </div>
+            )}
+
+            {errorMessage && (
+              <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-400/60 text-xs font-semibold text-rose-200 flex items-center gap-2">
+                <XCircle className="w-4 h-4 text-rose-300 shrink-0" />
+                <span>{errorMessage}</span>
+              </div>
+            )}
+            {statusMessage && (
+              <div className="p-3 rounded-xl bg-lime-400/15 border border-lime-300/60 text-xs font-semibold text-lime-200 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
+                <span>{statusMessage}</span>
+              </div>
+            )}
 
             <button
               type="submit"

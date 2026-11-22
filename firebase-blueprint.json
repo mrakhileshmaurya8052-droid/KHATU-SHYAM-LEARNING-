@@ -182,6 +182,24 @@
         "requirePayment": {
           "type": "boolean"
         },
+        "plan1Label": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "plan2Label": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "plan2Price": {
+          "type": "number"
+        },
+        "plan3Label": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "plan3Price": {
+          "type": "number"
+        },
         "displayOrder": {
           "type": "number"
         },
@@ -264,6 +282,10 @@
         "batchTitle": {
           "type": "string",
           "maxLength": 140
+        },
+        "planLabel": {
+          "type": "string",
+          "maxLength": 60
         },
         "amount": {
           "type": "number"

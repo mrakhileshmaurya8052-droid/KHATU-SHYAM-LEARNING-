@@ -3,10 +3,12 @@ import { doc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { QRCodeSVG } from 'qrcode.react';
 import {
   ArrowLeft,
+  ArrowRight,
   Check,
   Clock,
   Copy,
   ExternalLink,
+  Flame,
   ImagePlus,
   Lock,
   Send,
@@ -16,12 +18,50 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { ALL_PAYMENT_METHODS, Batch, Order, SiteSettings } from '../types';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { db, handleFirestoreError, isQuotaExceededError, OperationType } from '../firebase';
 import { compressImageFile } from '../utils/imageTools';
 import { BatchThumbnail } from './BatchThumbnail';
 import { VerifiedMark } from './VerifiedMark';
 
 type ModalStep = 'preview' | 'payment' | 'form' | 'status';
+
+interface CheckoutPlan {
+  id: 'plan1' | 'plan2' | 'plan3';
+  label: string;
+  price: number;
+  popular?: boolean;
+}
+
+function buildBatchPlans(batch: Batch): CheckoutPlan[] {
+  const basePrice = Math.max(0, Number(batch.price) || 0);
+  const plan2Price =
+    typeof batch.plan2Price === 'number' && !Number.isNaN(batch.plan2Price)
+      ? Math.max(0, batch.plan2Price)
+      : basePrice + 10;
+  const plan3Price =
+    typeof batch.plan3Price === 'number' && !Number.isNaN(batch.plan3Price)
+      ? Math.max(0, batch.plan3Price)
+      : basePrice + 20;
+
+  return [
+    {
+      id: 'plan1',
+      label: (batch.plan1Label || '').trim() || '1 Year',
+      price: basePrice,
+      popular: true,
+    },
+    {
+      id: 'plan2',
+      label: (batch.plan2Label || '').trim() || '2 Years',
+      price: plan2Price,
+    },
+    {
+      id: 'plan3',
+      label: (batch.plan3Label || '').trim() || 'Lifetime',
+      price: plan3Price,
+    },
+  ];
+}
 
 function getStudentClientId(): string {
   try {
@@ -60,8 +100,10 @@ export function BatchCheckoutModal({
   onOpenBatch: (order: Order, batch: Batch) => void;
   onClose: () => void;
 }) {
+  const plans = buildBatchPlans(batch);
   const initialStep: ModalStep = existingOrder ? 'status' : 'preview';
   const [step, setStep] = useState<ModalStep>(initialStep);
+  const [selectedPlan, setSelectedPlan] = useState<CheckoutPlan>(plans[0]);
   const [copiedUpi, setCopiedUpi] = useState(false);
 
   const enabledMethodObjects = ALL_PAYMENT_METHODS.filter((m) =>
@@ -80,12 +122,14 @@ export function BatchCheckoutModal({
   const [formError, setFormError] = useState('');
   const [createdOrderId, setCreatedOrderId] = useState('');
 
+  const activeAmount = selectedPlan.price;
+
   const upiUri = `upi://pay?pa=${encodeURIComponent(
     settings.upiId || 'khatushyamlearning@upi',
   )}&pn=${encodeURIComponent(
     settings.merchantName || settings.brandName,
-  )}&am=${encodeURIComponent(String(batch.price))}&cu=INR&tn=${encodeURIComponent(
-    batch.title.slice(0, 40),
+  )}&am=${encodeURIComponent(String(activeAmount))}&cu=INR&tn=${encodeURIComponent(
+    `${batch.title.slice(0, 26)} (${selectedPlan.label})`.slice(0, 40),
   )}`;
 
   const handleCopyUpi = async () => {
@@ -110,6 +154,12 @@ export function BatchCheckoutModal({
     }
   };
 
+  const handleSelectPlan = (plan: CheckoutPlan) => {
+    setSelectedPlan(plan);
+    setFormError('');
+    setStep('payment');
+  };
+
   const handleSubmitOrder = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
@@ -132,7 +182,8 @@ export function BatchCheckoutModal({
         studentPhone: studentPhone.trim().slice(0, 30),
         batchId: batch.id,
         batchTitle: batch.title.slice(0, 140),
-        amount: Number(batch.price),
+        planLabel: selectedPlan.label.slice(0, 60),
+        amount: Number(activeAmount),
         paymentMethod: paymentMethod.slice(0, 60),
         utrNumber: utrNumber.trim().slice(0, 100),
         screenshotUrl: screenshotUrl.slice(0, 500000),
@@ -149,6 +200,11 @@ export function BatchCheckoutModal({
       onOrderCreated(orderId);
       setStep('status');
     } catch (error) {
+      if (isQuotaExceededError(error)) {
+        setFormError('Database daily free quota is currently exceeded. Please try again after reset or contact Admin.');
+        setSubmitting(false);
+        return;
+      }
       try {
         handleFirestoreError(error, OperationType.CREATE, path);
       } catch (wrapped) {
@@ -162,11 +218,6 @@ export function BatchCheckoutModal({
       setSubmitting(false);
     }
   };
-
-  const discountPct =
-    batch.originalPrice > batch.price && batch.originalPrice > 0
-      ? Math.round(((batch.originalPrice - batch.price) / batch.originalPrice) * 100)
-      : 0;
 
   return (
     <div
@@ -188,7 +239,7 @@ export function BatchCheckoutModal({
                 onClick={() =>
                   setStep(step === 'form' ? 'payment' : 'preview')
                 }
-                className="p-2 rounded-xl border border-pink-400/35 text-pink-200 hover:text-white hover:bg-pink-500/15 transition-colors"
+                className="p-2 rounded-xl border border-pink-400/35 text-pink-200 hover:text-white hover:bg-pink-500/15 transition-colors cursor-pointer"
                 aria-label="Go back"
               >
                 <ArrowLeft className="w-4 h-4" />
@@ -216,67 +267,115 @@ export function BatchCheckoutModal({
           <button
             type="button"
             onClick={onClose}
-            className="p-2 rounded-xl border border-white/15 text-zinc-300 hover:text-white hover:border-pink-400/50 hover:bg-white/10 transition-colors shrink-0"
+            className="p-2 rounded-xl border border-white/15 text-zinc-300 hover:text-white hover:border-pink-400/50 hover:bg-white/10 transition-colors shrink-0 cursor-pointer"
             aria-label="Close modal"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Step 1: Stylish Batch Preview & Buy Now Prompt */}
+        {/* Step 1: Compact Header Preview + Ultra-Glow HD 3-Plan Selector */}
         {step === 'preview' && (
-          <div className="p-6 space-y-6">
-            <BatchThumbnail
-              src={batch.thumbnailUrl}
-              alt={batch.title}
-              aspect={batch.thumbnailAspect}
-              glow={batch.glowAccent}
-              className="rounded-2xl border border-white/20 shadow-[0_0_40px_-10px_rgba(244,114,182,0.4)]"
-            />
-
-            <div className="space-y-3">
-              <div className="flex items-center gap-2.5 flex-wrap">
-                <h4 className="font-display text-xl sm:text-2xl font-extrabold bg-gradient-to-r from-white via-pink-100 to-lime-100 bg-clip-text text-transparent">
-                  {batch.title}
-                </h4>
-                {batch.showCheckmark !== false && (
-                  <VerifiedMark theme={batch.glowAccent} size="sm" />
-                )}
+          <div className="p-5 sm:p-6 space-y-5">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4 p-3.5 rounded-2xl bg-[#070912]/90 border border-white/15 shadow-[0_0_32px_-12px_rgba(244,114,182,0.35)]">
+              <div className="w-full sm:w-36 shrink-0">
+                <BatchThumbnail
+                  src={batch.thumbnailUrl}
+                  alt={batch.title}
+                  aspect="16:9"
+                  glow={batch.glowAccent}
+                  className="rounded-xl border border-white/20"
+                />
               </div>
-              <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-pink-500/15 border border-pink-400/45 text-xs font-semibold text-pink-200">
-                <Lock className="w-3.5 h-3.5 text-pink-300 shrink-0" />
-                <span>Locked — Complete payment &amp; Admin approval to unlock</span>
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h4 className="font-display text-lg sm:text-xl font-extrabold bg-gradient-to-r from-white via-pink-100 to-lime-200 bg-clip-text text-transparent truncate">
+                    {batch.title}
+                  </h4>
+                  {batch.showCheckmark !== false && (
+                    <VerifiedMark theme={batch.glowAccent} size="sm" />
+                  )}
+                </div>
+                <p className="text-xs font-medium text-zinc-300 flex items-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-pink-300 shrink-0" />
+                  Choose your validity plan below to unlock instant access
+                </p>
               </div>
             </div>
 
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-[#0B0E18] border border-pink-400/35 shadow-[0_0_32px_-10px_rgba(244,114,182,0.4)]">
-              <div>
-                <p className="text-xs text-zinc-300">Batch Enrollment Fee</p>
-                <div className="flex items-baseline gap-3 mt-0.5">
-                  <span className="text-2xl font-extrabold font-mono tabular-nums text-white drop-shadow-[0_0_12px_rgba(255,255,255,0.4)]">
-                    {batch.price === 0 ? 'Free' : `₹${batch.price.toLocaleString('en-IN')}`}
-                  </span>
-                  {batch.originalPrice > batch.price && (
-                    <span className="text-sm font-mono tabular-nums text-zinc-400 line-through">
-                      ₹{batch.originalPrice.toLocaleString('en-IN')}
-                    </span>
-                  )}
-                  {discountPct > 0 && (
-                    <span className="text-xs font-extrabold text-lime-300">
-                      {discountPct}% Off
-                    </span>
-                  )}
-                </div>
-              </div>
+            {/* 3-Plan Ultra-Glow HD Stacked Card */}
+            <div className="relative rounded-2xl overflow-hidden border border-pink-400/55 bg-[#060811] shadow-[0_0_54px_-10px_rgba(244,114,182,0.55),0_0_40px_-12px_rgba(74,222,128,0.45)]">
+              <div className="pointer-events-none h-[2px] w-full bg-gradient-to-r from-pink-400 via-amber-200 to-lime-300" />
 
-              <button
-                type="button"
-                onClick={() => setStep('payment')}
-                className="inline-flex items-center justify-center gap-2 px-7 py-3.5 rounded-xl bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:from-pink-300 hover:to-lime-200 text-zinc-950 font-extrabold text-sm transition-all shadow-[0_0_34px_rgba(244,114,182,0.6),0_0_24px_rgba(74,222,128,0.45)] whitespace-nowrap shrink-0"
-              >
-                <Sparkles className="w-4 h-4" />
-                Buy Now — {batch.price === 0 ? 'Free' : `₹${batch.price.toLocaleString('en-IN')}`}
-              </button>
+              {plans.map((plan, idx) => {
+                const isPopular = Boolean(plan.popular);
+                return (
+                  <div
+                    key={plan.id}
+                    className={`relative flex items-center justify-between gap-3 sm:gap-5 px-4 sm:px-6 transition-all ${
+                      isPopular
+                        ? 'py-5 bg-gradient-to-r from-[#1E1032] via-[#13182E] to-[#0B221A] border-b border-pink-400/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.14)]'
+                        : `py-4 sm:py-5 bg-[#070A13]/95 hover:bg-[#0D1323] ${
+                            idx < plans.length - 1 ? 'border-b border-white/12' : ''
+                          }`
+                    }`}
+                  >
+                    {isPopular && (
+                      <span className="pointer-events-none absolute -top-10 left-10 w-56 h-24 rounded-full blur-2xl bg-pink-500/25" />
+                    )}
+
+                    {/* Left Column: Popular Kicker + Plan Duration */}
+                    <div className="relative z-10 min-w-0 flex-1 space-y-1">
+                      {isPopular && (
+                        <div className="inline-flex items-center gap-1.5 text-[11px] font-extrabold tracking-[0.14em] uppercase bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 bg-clip-text text-transparent drop-shadow-[0_0_10px_rgba(244,114,182,0.75)]">
+                          <Flame className="w-3.5 h-3.5 text-amber-300 shrink-0 drop-shadow-[0_0_8px_rgba(251,191,36,0.95)]" />
+                          <span>Most Popular</span>
+                        </div>
+                      )}
+                      <p
+                        className={`font-display truncate ${
+                          isPopular
+                            ? 'text-lg sm:text-xl font-extrabold text-white drop-shadow-[0_0_12px_rgba(255,255,255,0.3)]'
+                            : 'text-base sm:text-lg font-bold text-zinc-100'
+                        }`}
+                      >
+                        {plan.label}
+                      </p>
+                    </div>
+
+                    {/* Middle Column: Price */}
+                    <div className="relative z-10 text-right shrink-0">
+                      <span
+                        className={`font-mono tabular-nums font-extrabold ${
+                          isPopular
+                            ? 'text-xl sm:text-2xl text-white drop-shadow-[0_0_16px_rgba(244,114,182,0.8)]'
+                            : idx === 1
+                              ? 'text-xl sm:text-2xl text-cyan-200 drop-shadow-[0_0_12px_rgba(56,189,248,0.6)]'
+                              : 'text-xl sm:text-2xl text-lime-300 drop-shadow-[0_0_12px_rgba(74,222,128,0.65)]'
+                        }`}
+                      >
+                        ₹{plan.price.toLocaleString('en-IN')}
+                      </span>
+                    </div>
+
+                    {/* Right Column: Get Access -> CTA */}
+                    <button
+                      type="button"
+                      onClick={() => handleSelectPlan(plan)}
+                      className={`relative z-10 inline-flex items-center justify-center gap-1.5 min-h-[44px] px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-extrabold transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                        isPopular
+                          ? 'bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:from-pink-300 hover:to-lime-200 text-zinc-950 shadow-[0_0_32px_rgba(244,114,182,0.65),0_0_20px_rgba(74,222,128,0.45)] ring-1 ring-white/50'
+                          : idx === 1
+                            ? 'bg-[#10172A] hover:bg-gradient-to-r hover:from-cyan-300 hover:to-sky-300 text-white hover:text-zinc-950 border border-cyan-300/50 shadow-[0_0_24px_-6px_rgba(56,189,248,0.55)]'
+                            : 'bg-[#0D1815] hover:bg-gradient-to-r hover:from-lime-300 hover:to-emerald-400 text-white hover:text-zinc-950 border border-lime-300/50 shadow-[0_0_24px_-6px_rgba(74,222,128,0.55)]'
+                      }`}
+                    >
+                      <span>Get Access</span>
+                      <ArrowRight className="w-4 h-4 shrink-0" />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -288,9 +387,14 @@ export function BatchCheckoutModal({
               {/* Glowing QR Code Card */}
               <div className="relative flex flex-col items-center justify-center p-5 rounded-2xl bg-[#0B0E18] border border-lime-300/45 shadow-[0_0_40px_-10px_rgba(74,222,128,0.45)] space-y-4 text-center overflow-hidden">
                 <div className="pointer-events-none absolute inset-x-0 top-0 h-[1.5px] bg-gradient-to-r from-transparent via-lime-300 to-transparent" />
-                <p className="text-xs font-bold text-lime-300">
-                  Scan QR Code to Pay ₹{batch.price.toLocaleString('en-IN')}
-                </p>
+                <div className="space-y-1">
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-pink-300">
+                    Plan: {selectedPlan.label}
+                  </p>
+                  <p className="text-xs font-bold text-lime-300">
+                    Scan QR Code to Pay ₹{activeAmount.toLocaleString('en-IN')}
+                  </p>
+                </div>
                 <div className="p-3.5 rounded-2xl bg-white shadow-[0_0_36px_rgba(255,255,255,0.28)]">
                   {settings.qrImageUrl ? (
                     <img
@@ -546,7 +650,8 @@ export function BatchCheckoutModal({
 
             <div className="flex items-center justify-between gap-4 pt-3 border-t border-white/15">
               <div className="text-xs text-zinc-300">
-                Amount: <span className="font-mono text-white font-bold">₹{batch.price.toLocaleString('en-IN')}</span>
+                <span>{selectedPlan.label} · </span>
+                Amount: <span className="font-mono text-white font-bold">₹{activeAmount.toLocaleString('en-IN')}</span>
               </div>
               <button
                 type="submit"

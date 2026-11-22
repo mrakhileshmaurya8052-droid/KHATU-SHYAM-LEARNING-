@@ -7,6 +7,8 @@ const ALLOWED_HOST_SUFFIXES = [
 ];
 
 const ALLOWED_EXACT_HOSTS = [
+  'khatushyamlearning.vercel.app',
+  'www.khatushyamlearning.vercel.app',
   'khatushyamlearning.publicvm.com',
   'www.khatushyamlearning.publicvm.com',
 ];
@@ -63,21 +65,27 @@ function isEditableElement(target: EventTarget | null): boolean {
   return Boolean(target.isContentEditable || target.closest('[data-allow-copy="true"]'));
 }
 
+export function isUnauthorizedAdminEmbed(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (!window.location.pathname.startsWith('/ksl-admin-872')) return false;
+  if (window.top === window.self || !document.referrer) return false;
+  try {
+    const refHost = new URL(document.referrer).hostname;
+    return refHost !== window.location.hostname && !isBuiltInAuthorizedHost(refHost);
+  } catch {
+    return false;
+  }
+}
+
 export function initAntiCloneProtection(): boolean {
   if (typeof window === 'undefined') return true;
 
-  // 1. Unauthorized third-party iframe clickjacking / mirror protection (preserves AI Studio preview)
-  if (window.top !== window.self && document.referrer) {
-    try {
-      const refHost = new URL(document.referrer).hostname;
-      if (refHost !== window.location.hostname && !isBuiltInAuthorizedHost(refHost)) {
-        document.body.innerHTML =
-          '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#050508;color:#f87171;font-family:sans-serif;text-align:center;padding:24px;"><div><h1 style="font-size:20px;margin-bottom:8px;">Unauthorized Embed Blocked</h1><p style="font-size:13px;color:#a1a1aa;">External framing is not permitted.</p></div></div>';
-        throw new Error('Unauthorized iframe origin.');
-      }
-    } catch {
-      // Ignore unparseable referrer
-    }
+  // 1. Protect private Admin Panel from unauthorized third-party iframe clickjacking
+  //    Storefront ('/') remains embeddable so any app, WebView, or store can link/embed it.
+  if (isUnauthorizedAdminEmbed()) {
+    document.body.innerHTML =
+      '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#050508;color:#f87171;font-family:sans-serif;text-align:center;padding:24px;"><div><h1 style="font-size:20px;margin-bottom:8px;">Unauthorized Admin Embed Blocked</h1><p style="font-size:13px;color:#a1a1aa;">Admin Panel cannot be embedded on external domains.</p></div></div>';
+    throw new Error('Unauthorized admin iframe origin.');
   }
 
   // 2. Deter casual right-click saving, image dragging, and view-source shortcuts

@@ -85,7 +85,9 @@ service cloud.firestore {
         'title', 'subtitle', 'description', 'category', 'instructor',
         'price', 'originalPrice', 'thumbnailUrl', 'thumbnailSize',
         'thumbnailAspect', 'glowAccent', 'openType', 'isActive',
-        'isFeatured', 'showCheckmark', 'requirePayment', 'displayOrder', 'createdAt', 'updatedAt'
+        'isFeatured', 'showCheckmark', 'requirePayment',
+        'plan1Label', 'plan2Label', 'plan2Price', 'plan3Label', 'plan3Price',
+        'displayOrder', 'createdAt', 'updatedAt'
       ])
       && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
       && data.subtitle is string && data.subtitle.size() <= 240
@@ -103,6 +105,11 @@ service cloud.firestore {
       && data.isFeatured is bool
       && (!('showCheckmark' in data) || data.showCheckmark is bool)
       && (!('requirePayment' in data) || data.requirePayment is bool)
+      && (!('plan1Label' in data) || (data.plan1Label is string && data.plan1Label.size() <= 40))
+      && (!('plan2Label' in data) || (data.plan2Label is string && data.plan2Label.size() <= 40))
+      && (!('plan2Price' in data) || ((data.plan2Price is int || data.plan2Price is float) && data.plan2Price >= 0 && data.plan2Price <= 1000000))
+      && (!('plan3Label' in data) || (data.plan3Label is string && data.plan3Label.size() <= 40))
+      && (!('plan3Price' in data) || ((data.plan3Price is int || data.plan3Price is float) && data.plan3Price >= 0 && data.plan3Price <= 1000000))
       && (data.displayOrder is int || data.displayOrder is float) && data.displayOrder >= 0 && data.displayOrder <= 100000
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
@@ -125,7 +132,7 @@ service cloud.firestore {
       ])
       && data.keys().hasOnly([
         'userId', 'userEmail', 'studentName', 'studentPhone', 'batchId',
-        'batchTitle', 'amount', 'paymentMethod', 'utrNumber', 'screenshotUrl',
+        'batchTitle', 'planLabel', 'amount', 'paymentMethod', 'utrNumber', 'screenshotUrl',
         'studentNote', 'status', 'adminNote', 'openType', 'unlockedUrl',
         'unlockedInstructions', 'createdAt', 'updatedAt'
       ])
@@ -135,6 +142,7 @@ service cloud.firestore {
       && data.studentPhone is string && data.studentPhone.size() >= 5 && data.studentPhone.size() <= 30
       && isValidId(data.batchId)
       && data.batchTitle is string && data.batchTitle.size() >= 1 && data.batchTitle.size() <= 140
+      && (!('planLabel' in data) || (data.planLabel is string && data.planLabel.size() <= 60))
       && (data.amount is int || data.amount is float) && data.amount >= 0 && data.amount <= 1000000
       && data.paymentMethod is string && data.paymentMethod.size() >= 1 && data.paymentMethod.size() <= 60
       && data.utrNumber is string && data.utrNumber.size() >= 1 && data.utrNumber.size() <= 100
@@ -147,6 +155,20 @@ service cloud.firestore {
       && data.unlockedInstructions is string && data.unlockedInstructions.size() <= 1000
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
+    }
+
+    function isValidBatchOrderAmount(batchData, amt) {
+      return amt == batchData.price
+        || ('plan2Price' in batchData && (batchData.plan2Price is int || batchData.plan2Price is float) && amt == batchData.plan2Price)
+        || (!('plan2Price' in batchData) && amt == batchData.price + 10)
+        || ('plan3Price' in batchData && (batchData.plan3Price is int || batchData.plan3Price is float) && amt == batchData.plan3Price)
+        || (!('plan3Price' in batchData) && amt == batchData.price + 20);
+    }
+
+    function isMatchingActiveBatch(batchData, orderData) {
+      return batchData.isActive == true
+        && orderData.batchTitle == batchData.title
+        && isValidBatchOrderAmount(batchData, orderData.amount);
     }
 
     function isValidAdminMember(data) {
@@ -226,9 +248,10 @@ service cloud.firestore {
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && exists(/databases/$(database)/documents/batches/$(incoming().batchId))
-        && get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.isActive == true
-        && incoming().amount == get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.price
-        && incoming().batchTitle == get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.title;
+        && isMatchingActiveBatch(
+          get(/databases/$(database)/documents/batches/$(incoming().batchId)).data,
+          incoming()
+        );
       allow update: if isAdmin() && isValidId(orderId) && isValidOrder(incoming())
         && incoming().userId == existing().userId
         && incoming().batchId == existing().batchId

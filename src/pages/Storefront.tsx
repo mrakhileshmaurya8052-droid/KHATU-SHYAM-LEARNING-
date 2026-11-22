@@ -14,8 +14,7 @@ import {
   Unlock,
   X,
 } from 'lucide-react';
-import { db } from '../firebase';
-import { STARTER_BATCHES } from '../constants/defaults';
+import { db, FIRESTORE_UPGRADE_URL } from '../firebase';
 import { Batch, GlowTheme, Offer, Order, SiteSettings } from '../types';
 import { VerifiedMark } from '../components/VerifiedMark';
 import { BatchThumbnail } from '../components/BatchThumbnail';
@@ -58,6 +57,7 @@ export function Storefront({
   offers,
   orders,
   loadingData,
+  quotaExceeded = false,
   onOrderCreated,
 }: {
   settings: SiteSettings;
@@ -65,6 +65,7 @@ export function Storefront({
   offers: Offer[];
   orders: Order[];
   loadingData: boolean;
+  quotaExceeded?: boolean;
   onOrderCreated: (orderId: string) => void;
 }) {
   const [searchQuery, setSearchQuery] = useState('');
@@ -131,12 +132,12 @@ export function Storefront({
   const activeBatches = useMemo(
     () =>
       batches
-        .filter((b) => b.isActive)
+        .filter((b) => b.isActive !== false)
         .sort((a, b) => {
           const aDirect = hasPaymentFlow(a) ? 1 : 0;
           const bDirect = hasPaymentFlow(b) ? 1 : 0;
           if (aDirect !== bDirect) return aDirect - bDirect;
-          return a.displayOrder - b.displayOrder;
+          return (Number(a.displayOrder) || 0) - (Number(b.displayOrder) || 0);
         }),
     [batches],
   );
@@ -170,12 +171,6 @@ export function Storefront({
         const d = snap.data();
         targetUrl = String(d.targetUrl || '');
         accessInstructions = String(d.accessInstructions || '');
-      } else {
-        const starter = STARTER_BATCHES.find((s) => s.id === batch.id);
-        if (starter) {
-          targetUrl = starter.targetUrl;
-          accessInstructions = starter.accessInstructions;
-        }
       }
 
       const virtualFreeOrder: Order = {
@@ -393,11 +388,31 @@ export function Storefront({
               ))}
             </div>
           ) : filteredBatches.length === 0 ? (
-            <div className="p-12 rounded-2xl hd-glass-surface border border-white/15 text-center space-y-2">
-              <p className="text-base font-semibold text-white">No batches match your search</p>
-              <p className="text-xs text-zinc-300">
-                Try clearing your search to view all batches.
+            <div className="p-12 rounded-2xl hd-glass-surface border border-pink-300/30 text-center space-y-3">
+              <p className="text-base font-semibold text-white">
+                {searchQuery.trim()
+                  ? 'No batches match your search'
+                  : quotaExceeded
+                    ? 'Database Daily Read Quota Reached'
+                    : 'No batches published yet'}
               </p>
+              <p className="text-xs text-zinc-300 max-w-lg mx-auto leading-relaxed">
+                {searchQuery.trim()
+                  ? 'Try clearing your search to view all batches.'
+                  : quotaExceeded
+                    ? 'Firebase free daily read units for this database have reached their daily limit (resets tomorrow; see Spark plan details under Enterprise edition at firebase.google.com/pricing#cloud-firestore).'
+                    : 'Batches published from the Admin Panel will appear here automatically.'}
+              </p>
+              {!searchQuery.trim() && quotaExceeded && (
+                <a
+                  href={FIRESTORE_UPGRADE_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-amber-400/20 border border-amber-300/60 text-xs font-bold text-amber-200 hover:bg-amber-400/30"
+                >
+                  Open Firebase Database Upgrade Dialog
+                </a>
+              )}
             </div>
           ) : (
             (() => {
@@ -681,7 +696,8 @@ export function Storefront({
                           {ord.batchTitle}
                         </h3>
                         <p className="text-xs text-zinc-300">
-                          ₹{ord.amount.toLocaleString('en-IN')} · {ord.paymentMethod}
+                          ₹{ord.amount.toLocaleString('en-IN')}
+                          {ord.planLabel ? ` · ${ord.planLabel}` : ''} · {ord.paymentMethod}
                         </p>
                         {ord.adminNote && (
                           <p className="text-xs text-zinc-200 pt-1">

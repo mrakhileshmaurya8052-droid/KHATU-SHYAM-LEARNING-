@@ -2,7 +2,7 @@
 
 ## 1. Data & API Invariants
 1. **Batch Ownership & Secret Isolation**: Public `batches/{batchId}` documents NEVER store `targetUrl` or private access instructions. Private links live in `batches/{batchId}/private/access` (readable/writable only by verified admins for paid batches, and readable only for active `price == 0` or `requirePayment == false` no-payment batches so WebView links can load inside `/wv/open` without displaying the URL) and are copied into `orders/{orderId}.unlockedUrl` ONLY by an admin upon approving a payment.
-2. **Order Price & Entropy Integrity**: An `orders/{orderId}` creation MUST use a high-entropy `ord_...` ID (`>= 32` chars), set `status == 'pending'`, `unlockedUrl == ''`, `unlockedInstructions == ''`, `adminNote == ''`, reference an active `batches/{batchId}` document, and match the server-stored `price` and `title` of that batch.
+2. **Order Price & Entropy Integrity**: An `orders/{orderId}` creation MUST use a high-entropy `ord_...` ID (`>= 32` chars), set `status == 'pending'`, `unlockedUrl == ''`, `unlockedInstructions == ''`, `adminNote == ''`, reference an active `batches/{batchId}` document, and match the server-stored `price`, `plan2Price` (`price + 10` fallback), or `plan3Price` (`price + 20` fallback) and `title` of that batch.
 3. **PII Protection**: `orders/{orderId}` contains student phone, email, and UTR. `allow list` is strictly `isAdmin()`, and `allow get` requires knowing the exact 24–36+ char random `orderId`.
 4. **Server Timestamp Integrity**: `createdAt` and `updatedAt` MUST equal `request.time` on creation, `createdAt` is immutable on update, and `updatedAt` MUST equal `request.time` on update.
 5. **Admin Privileges**: Only verified admin accounts (`mrakhileshmaurya8052@gmail.com` with `email_verified == true` or UIDs in `/admins/{uid}`) can create/update/delete `batches`, `batches/*/private/*`, `offers`, `site_settings`, or approve/reject `orders`.
@@ -11,7 +11,7 @@
 
 ## 2. The "Dirty Dozen" Adversarial Payloads (Must All Return PERMISSION_DENIED / 401 / 403)
 1. **Self-Approved Order on Create**: Attacker submits `orders/ord_...` with `status: 'approved'` and `unlockedUrl: 'https://t.me/secret'`.
-2. **Price Tampering on Create**: Attacker submits `orders/ord_...` with `amount: 0` or `1` for a ₹1499 batch.
+2. **Price Tampering on Create**: Attacker submits `orders/ord_...` with `amount: 0`, `1`, or any value not equal to the batch's Plan 1 / Plan 2 / Plan 3 server price.
 3. **Shadow Ghost Field Injection**: Attacker creates `orders/ord_...` with valid fields plus `isAdmin: true`.
 4. **Orphan or Inactive Batch Reference**: Attacker creates `orders/ord_...` referencing a missing or `isActive: false` batch.
 5. **Student Self-Updating Order to Approved**: Attacker updates `orders/ord_...` changing `status` to `'approved'`.

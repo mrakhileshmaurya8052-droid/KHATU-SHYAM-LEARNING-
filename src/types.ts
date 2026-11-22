@@ -44,6 +44,11 @@ export interface Batch {
   isFeatured: boolean;
   showCheckmark?: boolean;
   requirePayment?: boolean;
+  plan1Label?: string;
+  plan2Label?: string;
+  plan2Price?: number;
+  plan3Label?: string;
+  plan3Price?: number;
   displayOrder: number;
   createdAt?: unknown;
   updatedAt?: unknown;
@@ -63,6 +68,7 @@ export interface Order {
   studentPhone: string;
   batchId: string;
   batchTitle: string;
+  planLabel?: string;
   amount: number;
   paymentMethod: string;
   utrNumber: string;

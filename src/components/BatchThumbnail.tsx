@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { BookOpen } from 'lucide-react';
 import { GlowTheme, ThumbnailAspect } from '../types';
 
@@ -37,6 +37,10 @@ export function BatchThumbnail({
   className?: string;
 }) {
   const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [src]);
 
   return (
     <div

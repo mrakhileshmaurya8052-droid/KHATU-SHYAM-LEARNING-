@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import dns from 'dns';
+import fs from 'fs';
+import os from 'os';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import path from 'path';
@@ -196,6 +198,8 @@ function isHostMatch(urlStr: string, requestHost: string): boolean {
 }
 
 const AUTHORIZED_CUSTOM_HOSTS = [
+  'khatushyamlearning.vercel.app',
+  'www.khatushyamlearning.vercel.app',
   'khatushyamlearning.publicvm.com',
   'www.khatushyamlearning.publicvm.com',
 ];
@@ -223,20 +227,51 @@ function apiSecurityGuard(req: Request, res: Response, next: NextFunction): void
     candidateHosts.some((h) => isHostMatch(urlStr, h));
 
   const origin = req.get('origin');
+  const referer = req.get('referer');
+
   if (origin && !matchesAnyHost(origin)) {
     res.status(403).json({ error: 'Forbidden origin.' });
     return;
   }
 
+  if (referer && !matchesAnyHost(referer)) {
+    res.status(403).json({ error: 'Invalid request referer.' });
+    return;
+  }
+
+  const hasSameHostOrigin = Boolean(origin && matchesAnyHost(origin));
+  const hasSameHostReferer = Boolean(referer && matchesAnyHost(referer));
   const secFetchSite = req.get('sec-fetch-site');
-  if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+  if (
+    secFetchSite &&
+    secFetchSite !== 'same-origin' &&
+    secFetchSite !== 'none' &&
+    !(hasSameHostOrigin || hasSameHostReferer)
+  ) {
     res.status(403).json({ error: 'Cross-site API requests are blocked.' });
     return;
   }
 
-  const referer = req.get('referer');
-  if (referer && !matchesAnyHost(referer)) {
-    res.status(403).json({ error: 'Invalid request referer.' });
+  const secFetchMode = req.get('sec-fetch-mode');
+  const secFetchDest = req.get('sec-fetch-dest');
+  if (secFetchMode === 'navigate' || secFetchDest === 'document') {
+    res.status(403).json({ error: 'Direct browser navigation to API is forbidden.' });
+    return;
+  }
+
+  if (req.method === 'POST' && !origin && !referer) {
+    res.status(403).json({ error: 'Origin verification failed.' });
+    return;
+  }
+
+  const ua = (req.get('user-agent') || '').trim();
+  if (
+    !ua ||
+    /(curl\/|wget\/|postmanruntime|insomnia|python-|httpx|aiohttp|okhttp|retrofit|go-http-client|axios\/|node-fetch|undici|scrapy|libwww-perl|java\/|dalvik\/|apache-httpclient)/i.test(
+      ua,
+    )
+  ) {
+    res.status(403).json({ error: 'External API clients are blocked.' });
     return;
   }
 
@@ -423,14 +458,23 @@ async function startServer() {
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
 
-  // Global security headers
+  // Global security headers (Storefront & WebView embeddable in any app/store; Admin stays frame-restricted)
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-DNS-Prefetch-Control', 'off');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), interest-cohort=()');
-    if (req.path.startsWith('/ksl-admin-872') || req.path.startsWith('/wv/')) {
+    if (req.path.startsWith('/ksl-admin-872')) {
       res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+      res.setHeader(
+        'Content-Security-Policy',
+        "frame-ancestors 'self' https://*.google.com https://*.googleusercontent.com https://*.run.app",
+      );
+    } else {
+      if (req.path.startsWith('/wv/')) {
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+      }
+      res.setHeader('Content-Security-Policy', 'frame-ancestors *');
     }
     next();
   });
@@ -448,6 +492,254 @@ async function startServer() {
 
   // Harden every /api/* endpoint against external cloning / cross-origin connections
   app.use('/api', apiSecurityGuard);
+
+  const CATALOG_CACHE_PATH = path.join(os.tmpdir(), 'ksl-catalog-cache.json');
+  const CATALOG_CACHE_TTL_MS = 120_000;
+
+  interface CatalogSnapshot {
+    settings: Record<string, unknown> | null;
+    batches: Record<string, unknown>[];
+    offers: Record<string, unknown>[];
+    updatedAt: number;
+  }
+
+  let catalogCache: CatalogSnapshot | null = (() => {
+    try {
+      if (!fs.existsSync(CATALOG_CACHE_PATH)) return null;
+      const parsed = JSON.parse(fs.readFileSync(CATALOG_CACHE_PATH, 'utf8')) as Partial<CatalogSnapshot>;
+      if (parsed && Array.isArray(parsed.batches) && Array.isArray(parsed.offers)) {
+        return {
+          settings: parsed.settings ?? null,
+          batches: parsed.batches,
+          offers: parsed.offers,
+          updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+        };
+      }
+    } catch {
+      // Ignore corrupt disk cache
+    }
+    return null;
+  })();
+
+  const saveCatalogCache = (next: CatalogSnapshot) => {
+    catalogCache = next;
+    try {
+      fs.writeFileSync(CATALOG_CACHE_PATH, JSON.stringify(next), 'utf8');
+    } catch {
+      // Ignore ephemeral filesystem errors
+    }
+  };
+
+  const getFirebaseConfigMeta = (): { projectId: string; databaseId: string } | null => {
+    try {
+      const cfgPath = path.resolve(__dirname, 'firebase-applet-config.json');
+      const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as {
+        projectId?: string;
+        firestoreDatabaseId?: string;
+      };
+      if (!raw.projectId || !raw.firestoreDatabaseId) return null;
+      return { projectId: raw.projectId, databaseId: raw.firestoreDatabaseId };
+    } catch {
+      return null;
+    }
+  };
+
+  const decodeFirestoreValue = (val: Record<string, unknown> | undefined): unknown => {
+    if (!val || typeof val !== 'object') return undefined;
+    if ('stringValue' in val) return String(val.stringValue ?? '');
+    if ('booleanValue' in val) return Boolean(val.booleanValue);
+    if ('integerValue' in val) return Number(val.integerValue);
+    if ('doubleValue' in val) return Number(val.doubleValue);
+    if ('timestampValue' in val) return String(val.timestampValue ?? '');
+    if ('nullValue' in val) return null;
+    if ('arrayValue' in val && val.arrayValue && typeof val.arrayValue === 'object') {
+      const values = (val.arrayValue as { values?: Record<string, unknown>[] }).values || [];
+      return values.map((v) => decodeFirestoreValue(v));
+    }
+    if ('mapValue' in val && val.mapValue && typeof val.mapValue === 'object') {
+      const fields = (val.mapValue as { fields?: Record<string, Record<string, unknown>> }).fields || {};
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(fields)) {
+        out[k] = decodeFirestoreValue(v);
+      }
+      return out;
+    }
+    return undefined;
+  };
+
+  const decodeFirestoreDocument = (docObj: {
+    name?: string;
+    fields?: Record<string, Record<string, unknown>>;
+  }): Record<string, unknown> => {
+    const id = typeof docObj.name === 'string' ? docObj.name.split('/').pop() || '' : '';
+    const decoded: Record<string, unknown> = id ? { id } : {};
+    if (docObj.fields && typeof docObj.fields === 'object') {
+      for (const [k, v] of Object.entries(docObj.fields)) {
+        decoded[k] = decodeFirestoreValue(v);
+      }
+    }
+    return decoded;
+  };
+
+  app.get('/api/public-catalog', async (req, res) => {
+    const ip = getClientIp(req);
+    const rate = checkRateBucket(`cat:${ip}`, 60_000, 120);
+    if (!rate.allowed) {
+      res.status(429).json({ error: `Rate limit exceeded. Retry in ${rate.retryAfterSec}s.` });
+      return;
+    }
+
+    const forceRefresh = req.query.refresh === '1';
+    if (!forceRefresh && catalogCache && Date.now() - catalogCache.updatedAt < CATALOG_CACHE_TTL_MS) {
+      res.json({
+        ok: true,
+        source: 'cache',
+        settings: catalogCache.settings,
+        batches: catalogCache.batches,
+        offers: catalogCache.offers,
+      });
+      return;
+    }
+
+    const meta = getFirebaseConfigMeta();
+    if (!meta) {
+      if (catalogCache) {
+        res.json({
+          ok: true,
+          source: 'stale-cache',
+          settings: catalogCache.settings,
+          batches: catalogCache.batches,
+          offers: catalogCache.offers,
+        });
+        return;
+      }
+      res.status(503).json({ ok: false, error: 'Database configuration unavailable.' });
+      return;
+    }
+
+    const base = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(meta.projectId)}/databases/${encodeURIComponent(meta.databaseId)}/documents`;
+    try {
+      const [settingsRes, batchesRes, offersRes] = await Promise.all([
+        fetch(`${base}/site_settings/global`, { signal: AbortSignal.timeout(5000) }),
+        fetch(`${base}/batches?pageSize=100`, { signal: AbortSignal.timeout(5000) }),
+        fetch(`${base}/offers?pageSize=100`, { signal: AbortSignal.timeout(5000) }),
+      ]);
+
+      const anyQuotaExceeded =
+        settingsRes.status === 429 || batchesRes.status === 429 || offersRes.status === 429;
+
+      if (anyQuotaExceeded) {
+        if (catalogCache && (catalogCache.batches.length > 0 || catalogCache.settings)) {
+          res.json({
+            ok: true,
+            source: 'stale-cache',
+            quotaLimited: true,
+            settings: catalogCache.settings,
+            batches: catalogCache.batches,
+            offers: catalogCache.offers,
+          });
+          return;
+        }
+        res.status(503).json({
+          ok: false,
+          quotaExceeded: true,
+          error: 'Firestore daily free quota exceeded.',
+        });
+        return;
+      }
+
+      let nextSettings: Record<string, unknown> | null = catalogCache?.settings ?? null;
+      if (settingsRes.ok) {
+        const sJson = (await settingsRes.json()) as {
+          name?: string;
+          fields?: Record<string, Record<string, unknown>>;
+        };
+        if (sJson.fields) {
+          const decoded = decodeFirestoreDocument(sJson);
+          delete decoded.id;
+          nextSettings = decoded;
+        }
+      }
+
+      let nextBatches: Record<string, unknown>[] = catalogCache?.batches ?? [];
+      if (batchesRes.ok) {
+        const bJson = (await batchesRes.json()) as {
+          documents?: Array<{ name?: string; fields?: Record<string, Record<string, unknown>> }>;
+        };
+        nextBatches = Array.isArray(bJson.documents)
+          ? bJson.documents.map((d) => decodeFirestoreDocument(d))
+          : [];
+      }
+
+      let nextOffers: Record<string, unknown>[] = catalogCache?.offers ?? [];
+      if (offersRes.ok) {
+        const oJson = (await offersRes.json()) as {
+          documents?: Array<{ name?: string; fields?: Record<string, Record<string, unknown>> }>;
+        };
+        nextOffers = Array.isArray(oJson.documents)
+          ? oJson.documents.map((d) => decodeFirestoreDocument(d))
+          : [];
+      }
+
+      const snapshot: CatalogSnapshot = {
+        settings: nextSettings,
+        batches: nextBatches,
+        offers: nextOffers,
+        updatedAt: Date.now(),
+      };
+      saveCatalogCache(snapshot);
+      res.json({
+        ok: true,
+        source: 'live',
+        settings: snapshot.settings,
+        batches: snapshot.batches,
+        offers: snapshot.offers,
+      });
+    } catch {
+      if (catalogCache) {
+        res.json({
+          ok: true,
+          source: 'stale-cache',
+          settings: catalogCache.settings,
+          batches: catalogCache.batches,
+          offers: catalogCache.offers,
+        });
+        return;
+      }
+      res.status(503).json({ ok: false, error: 'Failed to load catalog.' });
+    }
+  });
+
+  app.post('/api/admin/catalog-snapshot', requireAdminSession, (req, res) => {
+    const body = (req.body ?? {}) as {
+      settings?: Record<string, unknown> | null;
+      batches?: Record<string, unknown>[];
+      offers?: Record<string, unknown>[];
+    };
+    const safeBatches = Array.isArray(body.batches)
+      ? body.batches.slice(0, 100).map((b) => {
+          const copy = { ...b };
+          delete copy.targetUrl;
+          delete copy.accessInstructions;
+          return copy;
+        })
+      : (catalogCache?.batches ?? []);
+    const safeOffers = Array.isArray(body.offers)
+      ? body.offers.slice(0, 50)
+      : (catalogCache?.offers ?? []);
+    const safeSettings =
+      body.settings && typeof body.settings === 'object'
+        ? { ...body.settings }
+        : (catalogCache?.settings ?? null);
+
+    saveCatalogCache({
+      settings: safeSettings,
+      batches: safeBatches,
+      offers: safeOffers,
+      updatedAt: Date.now(),
+    });
+    res.json({ ok: true });
+  });
 
   app.post('/api/webview/seal', (req, res) => {
     const ip = getClientIp(req);
@@ -725,18 +1017,6 @@ Brand: KHATU SHYAM LEARNING`,
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
 
-    const secFetchSite = req.get('sec-fetch-site');
-    if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
-      res.status(403).type('html').send('<!doctype html><html><body style="background:#030307;color:#f472b6;font-family:sans-serif;text-align:center;padding:48px">Cross-site access blocked.</body></html>');
-      return;
-    }
-
-    const secFetchDest = req.get('sec-fetch-dest');
-    if (secFetchDest && secFetchDest === 'document') {
-      res.status(403).type('html').send('<!doctype html><html><body style="background:#030307;color:#f472b6;font-family:sans-serif;text-align:center;padding:48px">In-app WebView only. Direct opening is disabled.</body></html>');
-      return;
-    }
-
     const candidateHosts = [
       req.get('host'),
       req.get('x-forwarded-host')?.split(',')[0]?.trim(),
@@ -744,8 +1024,21 @@ Brand: KHATU SHYAM LEARNING`,
     ].filter((h): h is string => Boolean(h));
 
     const referer = req.get('referer');
-    if (referer && !candidateHosts.some((h) => isHostMatch(referer, h))) {
+    const hasSameHostReferer = Boolean(referer && candidateHosts.some((h) => isHostMatch(referer, h)));
+    if (referer && !hasSameHostReferer) {
       res.status(403).type('html').send('<!doctype html><html><body style="background:#030307;color:#f472b6;font-family:sans-serif;text-align:center;padding:48px">Invalid request origin.</body></html>');
+      return;
+    }
+
+    const secFetchSite = req.get('sec-fetch-site');
+    if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none' && !hasSameHostReferer) {
+      res.status(403).type('html').send('<!doctype html><html><body style="background:#030307;color:#f472b6;font-family:sans-serif;text-align:center;padding:48px">Cross-site access blocked.</body></html>');
+      return;
+    }
+
+    const secFetchDest = req.get('sec-fetch-dest');
+    if (secFetchDest && secFetchDest === 'document') {
+      res.status(403).type('html').send('<!doctype html><html><body style="background:#030307;color:#f472b6;font-family:sans-serif;text-align:center;padding:48px">In-app WebView only. Direct opening is disabled.</body></html>');
       return;
     }
 
@@ -793,8 +1086,14 @@ Brand: KHATU SHYAM LEARNING`,
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(__dirname, 'dist');
-    app.use(express.static(distDir));
+    app.use(
+      express.static(distDir, {
+        index: false,
+        maxAge: '7d',
+      }),
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

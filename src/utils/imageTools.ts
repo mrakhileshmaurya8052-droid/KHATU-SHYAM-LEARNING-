@@ -2,8 +2,8 @@ import { GlowTheme, ThumbnailAspect } from '../types';
 
 export async function compressImageFile(
   file: File,
-  maxDimension = 1280,
-  quality = 0.82,
+  maxDimension = 800,
+  quality = 0.78,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -30,13 +30,35 @@ export async function compressImageFile(
           reject(new Error('Canvas context unavailable.'));
           return;
         }
+        const encodeWithBudget = (
+          sourceCanvas: HTMLCanvasElement,
+          startQuality: number,
+        ): string => {
+          const qualities = [startQuality, 0.68, 0.54, 0.42, 0.3];
+          for (const q of qualities) {
+            const webpUrl = sourceCanvas.toDataURL('image/webp', q);
+            if (webpUrl.startsWith('data:image/webp') && webpUrl.length < 75000) {
+              return webpUrl;
+            }
+            const jpegUrl = sourceCanvas.toDataURL('image/jpeg', q);
+            if (jpegUrl.length < 75000) {
+              return jpegUrl;
+            }
+          }
+          // Last-resort downscale if still over budget
+          const smallCanvas = document.createElement('canvas');
+          smallCanvas.width = Math.max(320, Math.round(sourceCanvas.width * 0.6));
+          smallCanvas.height = Math.max(180, Math.round(sourceCanvas.height * 0.6));
+          const smallCtx = smallCanvas.getContext('2d');
+          if (smallCtx) {
+            smallCtx.drawImage(sourceCanvas, 0, 0, smallCanvas.width, smallCanvas.height);
+            return smallCanvas.toDataURL('image/jpeg', 0.5);
+          }
+          return sourceCanvas.toDataURL('image/jpeg', 0.3);
+        };
+
         ctx.drawImage(img, 0, 0, width, height);
-        const webpUrl = canvas.toDataURL('image/webp', quality);
-        if (webpUrl.startsWith('data:image/webp') && webpUrl.length < 360000) {
-          resolve(webpUrl);
-          return;
-        }
-        resolve(canvas.toDataURL('image/jpeg', quality));
+        resolve(encodeWithBudget(canvas, quality));
       };
       img.src = String(reader.result);
     };
@@ -288,7 +310,11 @@ export function generateHdThumbnailDataUrl(opts: ThumbnailGeneratorOptions): str
     ctx.fillText(priceLabel, bx + 22, bottomY - 2);
   }
 
-  const webp = canvas.toDataURL('image/webp', 0.88);
-  if (webp.startsWith('data:image/webp')) return webp;
-  return canvas.toDataURL('image/jpeg', 0.9);
+  for (const q of [0.76, 0.62, 0.48, 0.36]) {
+    const webp = canvas.toDataURL('image/webp', q);
+    if (webp.startsWith('data:image/webp') && webp.length < 75000) return webp;
+    const jpeg = canvas.toDataURL('image/jpeg', q);
+    if (jpeg.length < 75000) return jpeg;
+  }
+  return canvas.toDataURL('image/jpeg', 0.32);
 }
