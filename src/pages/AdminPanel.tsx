@@ -1834,7 +1834,7 @@ export function AdminPanel({
                   ? 'Every Batch, Offer, Payment Setting & Order Approval here updates https://khatushyamlearning.vercel.app/ immediately.'
                   : user && !isDbAdmin
                     ? `Signed in as ${user.email}, which is not admin. Switch to ${BOOTSTRAPPED_ADMIN_EMAIL} so updates sync live to khatushyamlearning.vercel.app.`
-                    : `Sign in once with ${BOOTSTRAPPED_ADMIN_EMAIL} so every update here pushes live to https://khatushyamlearning.vercel.app/.`}
+                    : `Click "Connect Vercel Sync (Google)" to open Google Sign-In in this browser and select ${BOOTSTRAPPED_ADMIN_EMAIL} (no request/OTP is sent to Gmail inbox).`}
               </p>
             </div>
           </div>
@@ -2418,7 +2418,7 @@ export function AdminPanel({
               {(!user || !isDbAdmin) && (
                 <div className="p-3.5 rounded-2xl bg-amber-400/12 border border-amber-300/45 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <p className="text-[11px] text-amber-100 leading-relaxed">
-                    Connect <span className="font-mono font-bold">{BOOTSTRAPPED_ADMIN_EMAIL}</span> once so updates push live to <span className="font-semibold">khatushyamlearning.vercel.app</span>. (If popup is blocked in Custom Tab or preview frame, tap <span className="font-bold">Open in Full Tab</span> or <span className="font-bold">⋮ → Open in Chrome</span>.)
+                    Tap <span className="font-bold">Connect Google Sync</span> to open the Google Sign-In popup in Chrome and choose <span className="font-mono font-bold">{BOOTSTRAPPED_ADMIN_EMAIL}</span> (no email/request comes to Gmail inbox). If popup is blocked, tap <span className="font-bold">Open in Full Tab</span> or <span className="font-bold">⋮ → Open in Chrome</span>.
                   </p>
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <a

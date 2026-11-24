@@ -3,7 +3,6 @@ import {
   getRedirectResult,
   onAuthStateChanged,
   signInWithPopup,
-  signInWithRedirect,
   signOut,
   User,
 } from 'firebase/auth';
@@ -512,27 +511,27 @@ function AppContent() {
 
   const handleAdminSignIn = async () => {
     setAuthError('');
+    const startedAt = Date.now();
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
       const code = (err as { code?: string })?.code || '';
+      const elapsedMs = Date.now() - startedAt;
       const inIframe = typeof window !== 'undefined' && window.self !== window.top;
-      if (
-        !inIframe &&
-        (code === 'auth/popup-blocked' ||
-          code === 'auth/operation-not-supported-in-this-environment')
-      ) {
-        await signInWithRedirect(auth, googleProvider);
-        return;
-      }
       const msg =
         inIframe
-          ? 'Google login popup was blocked inside preview frame. Open the Admin link in a full Chrome tab to connect.'
-          : code === 'auth/popup-closed-by-user'
-            ? 'Sign-in popup closed. Tap "Open in Chrome" (⋮ menu) if popups fail inside an in-app browser.'
-            : err instanceof Error
-              ? err.message
-              : 'Google Sign-In failed.';
+          ? 'Google login popup was blocked inside preview frame. Tap "Open Admin in Chrome Tab" to connect.'
+          : code === 'auth/popup-blocked'
+            ? 'Browser blocked the Google Sign-In popup. In Chrome tap the address bar icon (or ⋮ → Site settings) → Permissions → Pop-ups and redirects → Allow, then try again.'
+            : code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request'
+              ? elapsedMs < 1800
+                ? 'Popup auto-closed immediately (about:blank). You are inside an in-app Custom Tab (top-left X icon). Close it, open the Chrome app directly, and open /ksl-admin-872 there.'
+                : 'Sign-in popup closed before finishing. Open in full Chrome (not an in-app browser) and allow Pop-ups and redirects.'
+              : code === 'auth/operation-not-supported-in-this-environment'
+                ? 'This in-app browser does not support Google Sign-In popups. Open this Admin link in Chrome.'
+                : err instanceof Error
+                  ? err.message
+                  : 'Google Sign-In failed.';
       setAuthError(msg);
       throw new Error(msg);
     }
