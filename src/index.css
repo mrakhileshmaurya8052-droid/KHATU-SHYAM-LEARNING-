@@ -11,8 +11,11 @@
   html {
     font-family: var(--font-sans);
     background-color: #030307;
-    color: #f8fafc;
+    color: #f4f4f5;
     scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
   }
 
   h1, h2, h3, .font-display {
@@ -24,50 +27,111 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* 16K HD Multi-Spectrum Ultra-Glow Light-Dark Surfaces */
+/* Ultra-Dark HD Multi-Glow Canvas */
+.dark-hd-studio {
+  background-color: #030307;
+  background-image:
+    radial-gradient(ellipse 85% 45% at 20% 0%, rgba(244, 114, 182, 0.16), transparent 68%),
+    radial-gradient(ellipse 80% 45% at 80% 0%, rgba(74, 222, 128, 0.13), transparent 68%),
+    radial-gradient(circle at 12% 55%, rgba(56, 189, 248, 0.1), transparent 48%),
+    radial-gradient(ellipse 75% 40% at 50% 100%, rgba(244, 114, 182, 0.1), transparent 70%);
+}
+
+/* Ultra-Dark Glass Surface */
 .hd-glass-surface {
-  background: linear-gradient(155deg, rgba(24, 26, 40, 0.92) 0%, rgba(7, 9, 16, 0.96) 100%);
+  background: linear-gradient(
+    180deg,
+    rgba(16, 18, 30, 0.94) 0%,
+    rgba(7, 9, 17, 0.98) 100%
+  );
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
-    0 24px 64px -20px rgba(0, 0, 0, 0.95);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+    0 20px 50px -15px rgba(0, 0, 0, 0.94);
 }
 
+/* Ultra-Glow Topbar */
 .ultra-glow-topbar {
-  background: linear-gradient(135deg, rgba(20, 12, 28, 0.94) 0%, rgba(8, 14, 22, 0.94) 55%, rgba(8, 22, 18, 0.94) 100%);
+  background: linear-gradient(
+    180deg,
+    rgba(19, 21, 36, 0.94) 0%,
+    rgba(8, 10, 18, 0.97) 100%
+  );
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.35),
-    0 0 36px -4px rgba(244, 114, 182, 0.55),
-    0 0 64px -8px rgba(74, 222, 128, 0.45);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.2),
+    0 0 0 1px rgba(244, 114, 182, 0.35),
+    0 12px 36px -8px rgba(244, 114, 182, 0.3),
+    0 20px 44px -14px rgba(0, 0, 0, 0.95);
 }
 
+/* Card Theme Glows */
 .glow-card-amber {
   box-shadow:
-    inset 0 1px 0 0 rgba(253, 224, 71, 0.32),
-    0 0 0 1px rgba(251, 191, 36, 0.5),
-    0 0 48px -10px rgba(245, 158, 11, 0.55),
-    0 0 80px -24px rgba(244, 114, 182, 0.3);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    0 0 0 1px rgba(251, 191, 36, 0.42),
+    0 12px 36px -10px rgba(251, 191, 36, 0.28),
+    0 22px 48px -16px rgba(0, 0, 0, 0.94);
+}
+
+.glow-card-amber:hover {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+    0 0 0 1px rgba(251, 191, 36, 0.72),
+    0 16px 44px -8px rgba(251, 191, 36, 0.45),
+    0 24px 56px -14px rgba(0, 0, 0, 0.96);
 }
 
 .glow-card-crimson {
   box-shadow:
-    inset 0 1px 0 0 rgba(249, 168, 212, 0.4),
-    0 0 0 1px rgba(244, 114, 182, 0.6),
-    0 0 52px -8px rgba(236, 72, 153, 0.65),
-    0 0 80px -22px rgba(74, 222, 128, 0.3);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    0 0 0 1px rgba(244, 114, 182, 0.45),
+    0 12px 36px -10px rgba(244, 114, 182, 0.3),
+    0 22px 48px -16px rgba(0, 0, 0, 0.94);
+}
+
+.glow-card-crimson:hover {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+    0 0 0 1px rgba(244, 114, 182, 0.75),
+    0 16px 44px -8px rgba(244, 114, 182, 0.46),
+    0 24px 56px -14px rgba(0, 0, 0, 0.96);
 }
 
 .glow-card-sapphire {
   box-shadow:
-    inset 0 1px 0 0 rgba(125, 211, 252, 0.38),
-    0 0 0 1px rgba(56, 189, 248, 0.55),
-    0 0 52px -8px rgba(59, 130, 246, 0.6),
-    0 0 80px -22px rgba(244, 114, 182, 0.35);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    0 0 0 1px rgba(56, 189, 248, 0.45),
+    0 12px 36px -10px rgba(56, 189, 248, 0.3),
+    0 22px 48px -16px rgba(0, 0, 0, 0.94);
+}
+
+.glow-card-sapphire:hover {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+    0 0 0 1px rgba(56, 189, 248, 0.78),
+    0 16px 44px -8px rgba(56, 189, 248, 0.48),
+    0 24px 56px -14px rgba(0, 0, 0, 0.96);
 }
 
 .glow-card-emerald {
   box-shadow:
-    inset 0 1px 0 0 rgba(134, 239, 172, 0.42),
-    0 0 0 1px rgba(74, 222, 128, 0.6),
-    0 0 52px -8px rgba(74, 222, 128, 0.62),
-    0 0 80px -22px rgba(56, 189, 248, 0.3);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    0 0 0 1px rgba(74, 222, 128, 0.45),
+    0 12px 36px -10px rgba(74, 222, 128, 0.32),
+    0 22px 48px -16px rgba(0, 0, 0, 0.94);
+}
+
+.glow-card-emerald:hover {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+    0 0 0 1px rgba(74, 222, 128, 0.78),
+    0 16px 44px -8px rgba(74, 222, 128, 0.5),
+    0 24px 56px -14px rgba(0, 0, 0, 0.96);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

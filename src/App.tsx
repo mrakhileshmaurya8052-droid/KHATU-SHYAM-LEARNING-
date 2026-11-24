@@ -7,7 +7,14 @@ import {
   signOut,
   User,
 } from 'firebase/auth';
-import { collection, doc, getDoc, getDocs, onSnapshot } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocFromCache,
+  getDocs,
+  getDocsFromCache,
+} from 'firebase/firestore';
 import {
   auth,
   db,
@@ -52,10 +59,13 @@ function normalizeSettingsData(data?: Partial<SiteSettings> | null): SiteSetting
     !rawTg || rawTg === 'https://t.me/'
       ? DEFAULT_SITE_SETTINGS.supportTelegramUrl
       : rawTg;
+  const rawWa = typeof data.supportWhatsapp === 'string' ? data.supportWhatsapp.trim() : '';
+  const normalizedWa = rawWa || DEFAULT_SITE_SETTINGS.supportWhatsapp;
   return {
     ...DEFAULT_SITE_SETTINGS,
     ...data,
     supportTelegramUrl: normalizedTg,
+    supportWhatsapp: normalizedWa,
     customDomain:
       typeof data.customDomain === 'string' && data.customDomain.trim()
         ? data.customDomain.trim()
@@ -136,12 +146,20 @@ function AppContent() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const [authError, setAuthError] = useState('');
+
   useEffect(() => {
-    void getRedirectResult(auth).catch(() => {
-      // Ignore redirect auth errors on storefront load
-    });
+    void getRedirectResult(auth)
+      .then((res) => {
+        if (res?.user) setAuthError('');
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : 'Google Sign-In redirect failed.';
+        setAuthError(msg);
+      });
     const unsub = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
+      if (currentUser) setAuthError('');
     });
     return () => unsub();
   }, []);
@@ -183,14 +201,37 @@ function AppContent() {
     [],
   );
 
-  // Storefront data loader: server cache (/api/public-catalog) first -> single Firestore fallback if needed
+  // Live catalog loader: local IndexedDB cache (0 quota reads) -> server datastore (/api/public-catalog) -> Firestore fallback
   useEffect(() => {
-    if (route !== 'storefront') return;
     let active = true;
+
+    const recoverIndexedDbCache = async (): Promise<{
+      batches: Batch[];
+      offers: Offer[];
+      settings: Partial<SiteSettings> | null;
+    }> => {
+      try {
+        const [bSnap, oSnap, sSnap] = await Promise.all([
+          getDocsFromCache(collection(db, 'batches')).catch(() => null),
+          getDocsFromCache(collection(db, 'offers')).catch(() => null),
+          getDocFromCache(doc(db, 'site_settings', 'global')).catch(() => null),
+        ]);
+        const batches = bSnap
+          ? bSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Batch, 'id'>) }))
+          : [];
+        const offers = oSnap
+          ? oSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Offer, 'id'>) }))
+          : [];
+        const settingsData =
+          sSnap && sSnap.exists() ? (sSnap.data() as Partial<SiteSettings>) : null;
+        return { batches, offers, settings: settingsData };
+      } catch {
+        return { batches: [], offers: [], settings: null };
+      }
+    };
 
     const loadFromFirestoreFallback = async () => {
       const cached = readCachedCatalog();
-      // Avoid redundant reads on rapid reloads within 45s when we already have cached batches
       if (cached.batches.length > 0 && Date.now() - cached.ts < 45_000) {
         if (active) setLoadingBatches(false);
         return;
@@ -232,7 +273,28 @@ function AppContent() {
       }
     };
 
-    const loadStorefrontCatalog = async () => {
+    const loadLiveCatalog = async () => {
+      const idb = await recoverIndexedDbCache();
+      if (!active) return;
+      if (idb.batches.length > 0 || idb.offers.length > 0 || idb.settings) {
+        const currentLocal = readCachedCatalog();
+        const mergedBatches = [...idb.batches];
+        const seenB = new Set(mergedBatches.map((b) => b.id));
+        for (const cb of currentLocal.batches) {
+          if (!seenB.has(cb.id)) mergedBatches.push(cb);
+        }
+        const mergedOffers = [...idb.offers];
+        const seenO = new Set(mergedOffers.map((o) => o.id));
+        for (const co of currentLocal.offers) {
+          if (!seenO.has(co.id)) mergedOffers.push(co);
+        }
+        applyCatalogSnapshot({
+          settings: idb.settings ?? currentLocal.settings,
+          batches: mergedBatches.length > 0 ? mergedBatches : undefined,
+          offers: mergedOffers.length > 0 ? mergedOffers : undefined,
+        });
+      }
+
       try {
         const res = await fetch('/api/public-catalog', {
           credentials: 'same-origin',
@@ -243,8 +305,10 @@ function AppContent() {
         if (contentType.includes('application/json')) {
           const data = (await res.json()) as {
             ok?: boolean;
-            quotaLimited?: boolean;
-            quotaExceeded?: boolean;
+            firestoreSynced?: boolean;
+            firestoreQuotaBlocked?: boolean;
+            deletedBatchIds?: string[];
+            deletedOfferIds?: string[];
             settings?: Partial<SiteSettings> | null;
             batches?: Batch[];
             offers?: Offer[];
@@ -253,139 +317,188 @@ function AppContent() {
           if (!active) return;
 
           if (res.ok && data.ok) {
-            setQuotaExceeded(Boolean(data.quotaLimited));
-            applyCatalogSnapshot({
-              settings: data.settings ?? null,
-              batches: Array.isArray(data.batches) ? data.batches : [],
-              offers: Array.isArray(data.offers) ? data.offers : [],
-            });
-            return;
-          }
+            const serverBatches = Array.isArray(data.batches) ? data.batches : [];
+            const serverOffers = Array.isArray(data.offers) ? data.offers : [];
+            const deletedBatches = new Set(
+              Array.isArray(data.deletedBatchIds) ? data.deletedBatchIds : [],
+            );
+            const deletedOffers = new Set(
+              Array.isArray(data.deletedOfferIds) ? data.deletedOfferIds : [],
+            );
+            const cachedNow = readCachedCatalog();
 
-          if (data.quotaExceeded) {
-            setQuotaExceeded(true);
-            setLoadingBatches(false);
-            if (typeof window !== 'undefined' && !isBuiltInAuthorizedHost(window.location.hostname)) {
-              setDomainCheckStatus((prev) => (prev === 'checking' ? 'allowed' : prev));
+            // Merge server batches with any local cached batches not yet synced if Firestore hit 429
+            const mergedBatches = [...serverBatches];
+            if (data.firestoreQuotaBlocked && cachedNow.batches.length > 0) {
+              const seen = new Set(mergedBatches.map((b) => b.id));
+              for (const cb of cachedNow.batches) {
+                if (cb?.id && !seen.has(cb.id) && !deletedBatches.has(cb.id)) {
+                  mergedBatches.push(cb);
+                }
+              }
             }
+
+            const mergedOffers = [...serverOffers];
+            if (data.firestoreQuotaBlocked && cachedNow.offers.length > 0) {
+              const seenO = new Set(mergedOffers.map((o) => o.id));
+              for (const co of cachedNow.offers) {
+                if (co?.id && !seenO.has(co.id) && !deletedOffers.has(co.id)) {
+                  mergedOffers.push(co);
+                }
+              }
+            }
+
+            setQuotaExceeded(
+              mergedBatches.length === 0 && Boolean(data.firestoreQuotaBlocked),
+            );
+            applyCatalogSnapshot({
+              settings: data.settings ?? cachedNow.settings ?? null,
+              batches: mergedBatches,
+              offers: mergedOffers,
+            });
             return;
           }
         }
       } catch {
-        // Fallback cleanly to Firestore when backend route is unavailable (e.g. static deploy)
+        // Fall through to static Firestore fallback if backend route is unavailable
       }
 
       await loadFromFirestoreFallback();
     };
 
-    void loadStorefrontCatalog();
+    void loadLiveCatalog();
+
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        void loadLiveCatalog();
+      }
+    };
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    const handleCrossTabSync = () => {
+      void loadLiveCatalog();
+    };
+    window.addEventListener('storage', handleCrossTabSync);
+    let bc: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        bc = new BroadcastChannel('ksl_catalog_sync');
+        bc.onmessage = () => {
+          void loadLiveCatalog();
+        };
+      }
+    } catch {
+      bc = null;
+    }
+
+    const pollTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadLiveCatalog();
+      }
+    }, 20000);
 
     return () => {
       active = false;
+      clearInterval(pollTimer);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('storage', handleCrossTabSync);
+      if (bc) bc.close();
     };
   }, [route, applyCatalogSnapshot]);
 
-  // Admin Console live Firestore listeners (single listener per collection, no duplicate getDocs)
-  useEffect(() => {
-    if (route !== 'admin') return;
-    let active = true;
-
-    const unsubSettings = onSnapshot(
-      doc(db, 'site_settings', 'global'),
-      (snap) => {
-        if (!active) return;
-        setQuotaExceeded(false);
-        if (snap.exists()) {
-          applyCatalogSnapshot({
-            settings: snap.data() as Partial<SiteSettings>,
-          });
-        }
-      },
-      (err) => {
-        if (!active) return;
-        if (isQuotaExceededError(err)) setQuotaExceeded(true);
-        logFirestoreError(err, OperationType.GET, 'site_settings/global');
-      },
-    );
-
-    const unsubBatches = onSnapshot(
-      collection(db, 'batches'),
-      (snap) => {
-        if (!active) return;
-        setQuotaExceeded(false);
-        applyCatalogSnapshot({
-          batches: snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<Batch, 'id'>),
-          })),
-        });
-      },
-      (err) => {
-        if (!active) return;
-        if (isQuotaExceededError(err)) setQuotaExceeded(true);
-        setLoadingBatches(false);
-        logFirestoreError(err, OperationType.LIST, 'batches');
-      },
-    );
-
-    const unsubOffers = onSnapshot(
-      collection(db, 'offers'),
-      (snap) => {
-        if (!active) return;
-        applyCatalogSnapshot({
-          offers: snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<Offer, 'id'>),
-          })),
-        });
-      },
-      (err) => {
-        if (!active) return;
-        if (isQuotaExceededError(err)) setQuotaExceeded(true);
-        logFirestoreError(err, OperationType.LIST, 'offers');
-      },
-    );
-
-    return () => {
-      active = false;
-      unsubSettings();
-      unsubBatches();
-      unsubOffers();
-    };
-  }, [route, applyCatalogSnapshot]);
-
-  // Watch student's active order docs cleanly without polling/spamming quota
+  // Fetch & auto-refresh student's tracked orders from server datastore (/api/orders/status)
   useEffect(() => {
     if (myOrderIds.length === 0) {
       setStudentOrdersMap({});
       return;
     }
-    const recentIds = myOrderIds.slice(0, 6);
-    const unsubs = recentIds.map((orderId) =>
-      onSnapshot(
-        doc(db, 'orders', orderId),
-        (snap) => {
-          if (snap.exists()) {
-            setStudentOrdersMap((prev) => ({
-              ...prev,
-              [orderId]: {
+    let active = true;
+    const recentIds = myOrderIds.slice(0, 10);
+
+    const refreshOrderStatuses = async () => {
+      try {
+        const res = await fetch('/api/orders/status', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-KSL-Client': 'ksl-v1',
+          },
+          body: JSON.stringify({ orderIds: recentIds }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { ok?: boolean; orders?: Order[] };
+          if (active && data.ok && Array.isArray(data.orders)) {
+            setStudentOrdersMap((prev) => {
+              const next = { ...prev };
+              for (const ord of data.orders!) {
+                if (ord && ord.id) {
+                  next[ord.id] = ord;
+                }
+              }
+              return next;
+            });
+            return;
+          }
+        }
+        if (res.status !== 404) return;
+      } catch {
+        // Fallback below only if backend route is unavailable
+      }
+
+      try {
+        const snaps = await Promise.all(
+          recentIds.slice(0, 6).map((id) => getDoc(doc(db, 'orders', id))),
+        );
+        if (!active) return;
+        setStudentOrdersMap((prev) => {
+          const next = { ...prev };
+          for (const snap of snaps) {
+            if (snap.exists()) {
+              next[snap.id] = {
                 id: snap.id,
                 ...(snap.data() as Omit<Order, 'id'>),
-              },
-            }));
+              };
+            }
           }
-        },
-        () => {
-          // Ignore missing/quota/removed order doc cleanly
-        },
-      ),
-    );
+          return next;
+        });
+      } catch {
+        // Ignore fallback failure cleanly
+      }
+    };
+
+    void refreshOrderStatuses();
+
+    const handleFocus = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshOrderStatuses();
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshOrderStatuses();
+      }
+    }, 5000);
+
     return () => {
-      unsubs.forEach((u) => u());
+      active = false;
+      clearInterval(timer);
+      window.removeEventListener('focus', handleFocus);
     };
   }, [myOrderIds]);
 
-  const handleOrderCreated = (orderId: string) => {
+  const handleOrderCreated = (orderId: string, initialOrder?: Order) => {
+    if (initialOrder) {
+      setStudentOrdersMap((prev) => ({
+        ...prev,
+        [orderId]: initialOrder,
+      }));
+    }
     setMyOrderIds((prev) => {
       const next = (prev.includes(orderId) ? prev : [orderId, ...prev]).slice(0, 10);
       try {
@@ -398,15 +511,30 @@ function AppContent() {
   };
 
   const handleAdminSignIn = async () => {
+    setAuthError('');
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
       const code = (err as { code?: string })?.code || '';
-      if (code === 'auth/popup-blocked') {
+      const inIframe = typeof window !== 'undefined' && window.self !== window.top;
+      if (
+        !inIframe &&
+        (code === 'auth/popup-blocked' ||
+          code === 'auth/operation-not-supported-in-this-environment')
+      ) {
         await signInWithRedirect(auth, googleProvider);
         return;
       }
-      throw err;
+      const msg =
+        inIframe
+          ? 'Google login popup was blocked inside preview frame. Open the Admin link in a full Chrome tab to connect.'
+          : code === 'auth/popup-closed-by-user'
+            ? 'Sign-in popup closed. Tap "Open in Chrome" (⋮ menu) if popups fail inside an in-app browser.'
+            : err instanceof Error
+              ? err.message
+              : 'Google Sign-In failed.';
+      setAuthError(msg);
+      throw new Error(msg);
     }
   };
 
@@ -447,7 +575,7 @@ function AppContent() {
           <div className="space-y-2 max-w-md">
             <h1 className="text-xl font-bold">Unauthorized Admin Embed Blocked</h1>
             <p className="text-xs text-zinc-400">
-              Admin Panel can only be opened directly or inside authorized preview hosts.
+              Admin Panel can only be opened directly or on authorized app hosts.
             </p>
           </div>
         </div>
@@ -456,6 +584,7 @@ function AppContent() {
     return (
       <AdminPanel
         user={user}
+        authError={authError}
         settings={settings}
         batches={dbBatches}
         offers={offers}

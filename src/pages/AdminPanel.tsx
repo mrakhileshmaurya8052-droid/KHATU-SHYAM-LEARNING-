@@ -1,15 +1,18 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { User } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
   doc,
   getDoc,
+  getDocFromCache,
+  getDocsFromCache,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   writeBatch,
 } from 'firebase/firestore';
 import { QRCodeSVG } from 'qrcode.react';
@@ -27,12 +30,11 @@ import {
   KeyRound,
   LayoutDashboard,
   Layers,
-  LogIn,
   LogOut,
   Plus,
   QrCode,
+  RefreshCw,
   Settings,
-  ShieldAlert,
   Trash2,
   Users,
   Wand2,
@@ -53,11 +55,10 @@ import {
   BOOTSTRAPPED_ADMIN_EMAIL,
   db,
   FIRESTORE_UPGRADE_URL,
-  handleFirestoreError,
-  isQuotaExceededError,
   logFirestoreError,
   OperationType,
 } from '../firebase';
+import { readCachedCatalog } from '../utils/catalogCache';
 import { DEFAULT_SITE_SETTINGS } from '../constants/defaults';
 import {
   compressImageFile,
@@ -119,16 +120,18 @@ const EMPTY_BATCH_FORM: BatchFormState = {
 
 export function AdminPanel({
   user,
+  authError = '',
   settings,
   batches,
   offers,
-  quotaExceeded = false,
+  quotaExceeded: _quotaExceeded = false,
   onSyncCatalog,
   onSignIn,
   onSignOut,
   onBackToStorefront,
 }: {
   user: User | null;
+  authError?: string;
   settings: SiteSettings;
   batches: Batch[];
   offers: Offer[];
@@ -156,10 +159,17 @@ export function AdminPanel({
   const [verifyingCode, setVerifyingCode] = useState(false);
 
   const [isDbAdmin, setIsDbAdmin] = useState(false);
-  const [checkingAdmin, setCheckingAdmin] = useState(false);
+  const [connectingSync, setConnectingSync] = useState(false);
+  const [pushingToVercel, setPushingToVercel] = useState(false);
 
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
-  const [allOrders, setAllOrders] = useState<Order[]>([]);
+  const [serverOrders, setServerOrders] = useState<Order[]>([]);
+  const [firestoreOrders, setFirestoreOrders] = useState<Order[]>([]);
+  const [firestoreSynced, setFirestoreSynced] = useState<boolean>(true);
+  const [syncingFirestore, setSyncingFirestore] = useState<boolean>(false);
+  const [secretTargets, setSecretTargets] = useState<
+    Record<string, { targetUrl?: string; accessInstructions?: string }>
+  >({});
   const [statusMessage, setStatusMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
 
@@ -204,33 +214,36 @@ export function AdminPanel({
     pointsToGoogleHost: boolean;
     connected: boolean;
   } | null>(null);
-  const [connectingDb, setConnectingDb] = useState(false);
 
+  const lastSettingsJsonRef = React.useRef<string>('');
   useEffect(() => {
-    setSettingsForm(settings);
+    const serialized = JSON.stringify(settings);
+    if (serialized !== lastSettingsJsonRef.current) {
+      lastSettingsJsonRef.current = serialized;
+      setSettingsForm(settings);
+    }
   }, [settings]);
 
-  // Verify whether signed-in user is bootstrapped admin or in /admins
+  // Verify optional Firestore cloud backup role silently when signed in
   useEffect(() => {
     if (!user) {
       setIsDbAdmin(false);
       return;
     }
-    if (user.email === BOOTSTRAPPED_ADMIN_EMAIL && user.emailVerified) {
+    if (
+      user.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase() &&
+      user.emailVerified
+    ) {
       setIsDbAdmin(true);
       return;
     }
     let cancelled = false;
-    setCheckingAdmin(true);
     getDoc(doc(db, 'admins', user.uid))
       .then((snap) => {
         if (!cancelled) setIsDbAdmin(snap.exists());
       })
       .catch(() => {
         if (!cancelled) setIsDbAdmin(false);
-      })
-      .finally(() => {
-        if (!cancelled) setCheckingAdmin(false);
       });
     return () => {
       cancelled = true;
@@ -239,34 +252,233 @@ export function AdminPanel({
 
   const unlocked = codeVerified;
 
-  // Listen to all orders once Admin is unlocked and DB session is authorized
+  const adminHeaders = useCallback(
+    (includeJson = true): Record<string, string> => {
+      let token = adminToken;
+      if (!token) {
+        try {
+          token = sessionStorage.getItem('ksl_admin_token') || '';
+        } catch {
+          token = '';
+        }
+      }
+      return {
+        ...(includeJson ? { 'Content-Type': 'application/json' } : {}),
+        'X-KSL-Client': 'ksl-v1',
+        ...(token ? { 'X-Admin-Session': token } : {}),
+      };
+    },
+    [adminToken],
+  );
+
+  const handleSessionExpired = useCallback(() => {
+    try {
+      sessionStorage.removeItem('ksl_admin_token');
+    } catch {
+      // ignore
+    }
+    setAdminToken('');
+    setCodeVerified(false);
+    setCodeError('Session expired. Please enter Admin Access Code to continue.');
+  }, []);
+
+  const fetchAdminBootstrap = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/bootstrap', {
+        credentials: 'same-origin',
+        headers: adminHeaders(false),
+      });
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        ok?: boolean;
+        firestoreSynced?: boolean;
+        settings?: Partial<SiteSettings> | null;
+        batches?: Batch[];
+        batchSecrets?: Record<string, { targetUrl?: string; accessInstructions?: string }>;
+        offers?: Offer[];
+        orders?: Order[];
+      };
+      if (!data.ok) return;
+      setFirestoreSynced(Boolean(data.firestoreSynced));
+
+      let currentBatches = Array.isArray(data.batches) ? data.batches : [];
+      let currentOffers = Array.isArray(data.offers) ? data.offers : [];
+      let currentSettings = data.settings ?? null;
+      let currentSecrets =
+        data.batchSecrets && typeof data.batchSecrets === 'object' ? data.batchSecrets : {};
+
+      // Rescue any old batches/offers/secrets cached in browser IndexedDB or localStorage
+      try {
+        const localCached = readCachedCatalog();
+        const [bSnap, oSnap, sSnap] = await Promise.all([
+          getDocsFromCache(collection(db, 'batches')).catch(() => null),
+          getDocsFromCache(collection(db, 'offers')).catch(() => null),
+          getDocFromCache(doc(db, 'site_settings', 'global')).catch(() => null),
+        ]);
+
+        const cachedBatches: Batch[] = [
+          ...(bSnap ? bSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Batch, 'id'>) })) : []),
+          ...localCached.batches,
+        ];
+        const cachedOffers: Offer[] = [
+          ...(oSnap ? oSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Offer, 'id'>) })) : []),
+          ...localCached.offers,
+        ];
+        const cachedSettings =
+          sSnap && sSnap.exists() ? (sSnap.data() as Partial<SiteSettings>) : localCached.settings;
+
+        const serverBatchIds = new Set(currentBatches.map((b) => b.id));
+        const serverOfferIds = new Set(currentOffers.map((o) => o.id));
+        const extraBatches = cachedBatches.filter((b) => b && b.id && !serverBatchIds.has(b.id));
+        const extraOffers = cachedOffers.filter((o) => o && o.id && !serverOfferIds.has(o.id));
+        const extraSecrets: Record<string, { targetUrl?: string; accessInstructions?: string }> = {};
+
+        for (const b of cachedBatches) {
+          if (b && b.id && !currentSecrets[b.id]) {
+            const sec = await getDocFromCache(
+              doc(db, 'batches', b.id, 'private', 'access'),
+            ).catch(() => null);
+            if (sec && sec.exists()) {
+              const sd = sec.data();
+              if (sd?.targetUrl) {
+                extraSecrets[b.id] = {
+                  targetUrl: String(sd.targetUrl || ''),
+                  accessInstructions: String(sd.accessInstructions || ''),
+                };
+              }
+            }
+          }
+        }
+
+        if (
+          extraBatches.length > 0 ||
+          extraOffers.length > 0 ||
+          (!currentSettings && cachedSettings) ||
+          Object.keys(extraSecrets).length > 0
+        ) {
+          const mergeRes = await fetch('/api/admin/merge-cache', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: adminHeaders(),
+            body: JSON.stringify({
+              settings: !currentSettings ? cachedSettings : null,
+              batches: extraBatches,
+              offers: extraOffers,
+              batchSecrets: extraSecrets,
+            }),
+          });
+          if (mergeRes.ok) {
+            const mergedData = (await mergeRes.json()) as {
+              ok?: boolean;
+              settings?: Partial<SiteSettings> | null;
+              batches?: Batch[];
+              batchSecrets?: Record<string, { targetUrl?: string; accessInstructions?: string }>;
+              offers?: Offer[];
+            };
+            if (mergedData.ok) {
+              if (Array.isArray(mergedData.batches)) currentBatches = mergedData.batches;
+              if (Array.isArray(mergedData.offers)) currentOffers = mergedData.offers;
+              if (mergedData.settings) currentSettings = mergedData.settings;
+              if (mergedData.batchSecrets) currentSecrets = mergedData.batchSecrets;
+            }
+          }
+        }
+      } catch {
+        // Ignore browser cache lookup issues cleanly
+      }
+
+      if (Array.isArray(data.orders)) {
+        setServerOrders(data.orders);
+      }
+      setSecretTargets(currentSecrets);
+      onSyncCatalog?.({
+        settings: currentSettings,
+        batches: currentBatches,
+        offers: currentOffers,
+      });
+    } catch {
+      // Keep current state if transient network hiccup occurs
+    }
+  }, [adminHeaders, handleSessionExpired, onSyncCatalog]);
+
+  // Load live batches, offers, secrets, settings & orders directly from server store once unlocked
   useEffect(() => {
-    if (!unlocked || !isDbAdmin) {
-      setAllOrders([]);
+    if (!unlocked) {
+      setServerOrders([]);
+      setFirestoreOrders([]);
+      return;
+    }
+    void fetchAdminBootstrap();
+    const timer = setInterval(() => {
+      void fetchAdminBootstrap();
+    }, 10000);
+    return () => clearInterval(timer);
+  }, [unlocked, fetchAdminBootstrap]);
+
+  // Listen in real time to student orders placed on https://khatushyamlearning.vercel.app/ via Firestore
+  useEffect(() => {
+    if (!unlocked || !user || !isDbAdmin) {
+      setFirestoreOrders([]);
       return;
     }
     const q = query(collection(db, 'orders'), orderBy('createdAt', 'desc'));
     const unsub = onSnapshot(
       q,
       (snap) => {
-        const list: Order[] = snap.docs.map((d) => ({
+        const docs = snap.docs.map((d) => ({
           id: d.id,
           ...(d.data() as Omit<Order, 'id'>),
         }));
-        setAllOrders(list);
+        setFirestoreOrders(docs);
+        if (docs.length > 0) {
+          void fetch('/api/admin/sync-orders', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: adminHeaders(),
+            body: JSON.stringify({ orders: docs }),
+          }).catch(() => {});
+        }
       },
       (err) => {
-        if (isQuotaExceededError(err)) {
-          setErrorMessage(
-            'Firestore daily free read quota is exceeded right now. Pending orders will load again after reset or upgrade.',
-          );
-          return;
-        }
-        handleFirestoreError(err, OperationType.LIST, 'orders');
+        const msg = logFirestoreError(err, OperationType.LIST, 'orders');
+        setErrorMessage(msg);
       },
     );
     return () => unsub();
-  }, [unlocked, isDbAdmin]);
+  }, [unlocked, user, isDbAdmin, adminHeaders]);
+
+  const toTimestampMs = (value: unknown): number => {
+    if (typeof value === 'string') {
+      const ms = Date.parse(value);
+      return Number.isFinite(ms) ? ms : 0;
+    }
+    if (value && typeof value === 'object' && 'seconds' in value) {
+      const sec = Number((value as { seconds?: number }).seconds || 0);
+      return Number.isFinite(sec) ? sec * 1000 : 0;
+    }
+    return 0;
+  };
+
+  const allOrders = useMemo(() => {
+    const byId = new Map<string, Order>();
+    for (const o of serverOrders) {
+      if (o?.id) byId.set(o.id, o);
+    }
+    for (const fo of firestoreOrders) {
+      if (!fo?.id) continue;
+      const existing = byId.get(fo.id);
+      if (!existing || toTimestampMs(fo.updatedAt) >= toTimestampMs(existing.updatedAt)) {
+        byId.set(fo.id, fo);
+      }
+    }
+    return Array.from(byId.values()).sort(
+      (a, b) => toTimestampMs(b.createdAt) - toTimestampMs(a.createdAt),
+    );
+  }, [serverOrders, firestoreOrders]);
 
   const adminUrl =
     typeof window !== 'undefined'
@@ -279,18 +491,26 @@ export function AdminPanel({
   // Verify server-issued HMAC admin session on mount so DevTools sessionStorage tampering cannot unlock the panel
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
     const verifyServerSession = async () => {
       try {
         const res = await fetch('/api/admin/session', {
           credentials: 'same-origin',
+          signal: controller.signal,
           headers: {
             'X-KSL-Client': 'ksl-v1',
             ...(adminToken ? { 'X-Admin-Session': adminToken } : {}),
           },
         });
         if (!active) return;
-        setCodeVerified(res.ok);
-        if (!res.ok) {
+        const ct = res.headers.get('content-type') || '';
+        const data = ct.includes('application/json')
+          ? ((await res.json().catch(() => ({}))) as { ok?: boolean })
+          : { ok: false };
+        const valid = res.ok && data.ok === true;
+        setCodeVerified(valid);
+        if (!valid) {
           setAdminToken('');
           try {
             sessionStorage.removeItem('ksl_admin_token');
@@ -301,12 +521,15 @@ export function AdminPanel({
       } catch {
         if (active) setCodeVerified(false);
       } finally {
+        clearTimeout(timeoutId);
         if (active) setCheckingSession(false);
       }
     };
     void verifyServerSession();
     return () => {
       active = false;
+      clearTimeout(timeoutId);
+      controller.abort();
     };
   }, []);
 
@@ -350,53 +573,195 @@ export function AdminPanel({
   const showToast = (msg: string) => {
     setStatusMessage(msg);
     setErrorMessage('');
-    setTimeout(() => setStatusMessage(''), 4000);
+    setTimeout(() => setStatusMessage(''), 4500);
   };
 
-  const handleConnectDb = async () => {
-    setErrorMessage('');
-    setConnectingDb(true);
+  const resolveExistingCreatedAt = async (colName: 'batches' | 'offers', docId: string) => {
     try {
-      await onSignIn();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Google sign-in could not be completed.';
-      if (msg.includes('popup-closed-by-user')) {
-        setErrorMessage('Sign-in popup was closed. Please complete Google sign-in to sync database.');
-      } else {
-        setErrorMessage(msg);
+      const snap = await getDoc(doc(db, colName, docId));
+      if (snap.exists() && snap.data()?.createdAt) {
+        return snap.data().createdAt;
       }
+    } catch {
+      // fallback to serverTimestamp if doc doesn't exist or lookup fails
+    }
+    return serverTimestamp();
+  };
+
+  const handleConnectVercelSync = async () => {
+    setConnectingSync(true);
+    setErrorMessage('');
+    try {
+      if (user && !isDbAdmin) {
+        await onSignOut();
+      }
+      await onSignIn();
+      showToast('Connected live sync with khatushyamlearning.vercel.app!');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Google Sign-In was cancelled or blocked.';
+      setErrorMessage(`Could not connect Google Admin Sync: ${msg}`);
     } finally {
-      setConnectingDb(false);
+      setConnectingSync(false);
     }
   };
 
-  const ensureDbWriteAccess = (): boolean => {
-    if (user && isDbAdmin) return true;
-    setErrorMessage(
-      `Database sync required! Tap "Connect Database Sync" (${BOOTSTRAPPED_ADMIN_EMAIL}) first, then tap Publish.`,
-    );
-    return false;
-  };
-
-  const pushCatalogSnapshot = async (next: {
-    settings?: SiteSettings;
-    batches?: Batch[];
-    offers?: Offer[];
-  }) => {
-    onSyncCatalog?.(next);
+  const handleSyncOldFirebaseBatches = async () => {
+    setSyncingFirestore(true);
+    setErrorMessage('');
     try {
-      await fetch('/api/admin/catalog-snapshot', {
+      const res = await fetch('/api/admin/sync-firestore', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-KSL-Client': 'ksl-v1',
-          ...(adminToken ? { 'X-Admin-Session': adminToken } : {}),
-        },
-        body: JSON.stringify(next),
+        headers: adminHeaders(),
+        body: JSON.stringify({}),
       });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        synced?: boolean;
+        quotaExceeded?: boolean;
+        addedBatches?: number;
+        addedOffers?: number;
+        batches?: Batch[];
+        offers?: Offer[];
+        settings?: Partial<SiteSettings> | null;
+      };
+      if (data.synced || (Array.isArray(data.batches) && data.batches.length > 0)) {
+        setFirestoreSynced(true);
+        onSyncCatalog?.({
+          batches: Array.isArray(data.batches) ? data.batches : batches,
+          offers: Array.isArray(data.offers) ? data.offers : offers,
+          settings: data.settings ?? settings,
+        });
+        showToast(
+          `Synced live from khatushyamlearning.vercel.app (${Array.isArray(data.batches) ? data.batches.length : 0} batches, ${Array.isArray(data.offers) ? data.offers.length : 0} offers).`,
+        );
+      } else if (data.quotaExceeded) {
+        setErrorMessage(
+          'Firebase Firestore free daily read quota is currently full. Quota resets tomorrow.',
+        );
+      } else {
+        setErrorMessage('Could not pull catalog from Firebase right now. Please try again shortly.');
+      }
     } catch {
-      // Ignore if running on static host without /api backend
+      setErrorMessage('Failed to reach server for Vercel/Firebase sync.');
+    } finally {
+      setSyncingFirestore(false);
+    }
+  };
+
+  const handlePushAllToVercel = async () => {
+    if (!user || !isDbAdmin) {
+      setErrorMessage(`Click "Connect Vercel Sync" with ${BOOTSTRAPPED_ADMIN_EMAIL} first.`);
+      return;
+    }
+    setPushingToVercel(true);
+    setErrorMessage('');
+    try {
+      const rawCustomDomain = (settingsForm.customDomain || '').trim();
+      const normalizedCustomDomain = rawCustomDomain ? normalizeCustomDomain(rawCustomDomain) : '';
+      const cleanSettings = {
+        brandName: (settingsForm.brandName.trim() || 'KHATU SHYAM LEARNING').slice(0, 100),
+        showCheckmark: Boolean(settingsForm.showCheckmark),
+        popupEnabled: Boolean(settingsForm.popupEnabled),
+        popupText: settingsForm.popupText.trim().slice(0, 240),
+        popupCtaText: settingsForm.popupCtaText.trim().slice(0, 60),
+        heroTitle: (settingsForm.heroTitle.trim() || DEFAULT_SITE_SETTINGS.heroTitle).slice(0, 160),
+        heroSubtitle: settingsForm.heroSubtitle.trim().slice(0, 400),
+        glowTheme: settingsForm.glowTheme,
+        upiId: settingsForm.upiId.trim().slice(0, 120),
+        merchantName: settingsForm.merchantName.trim().slice(0, 100),
+        qrImageUrl: settingsForm.qrImageUrl,
+        bankDetails: settingsForm.bankDetails.trim().slice(0, 500),
+        paymentInstructions: settingsForm.paymentInstructions.trim().slice(0, 600),
+        gatewayPaymentUrl: settingsForm.gatewayPaymentUrl.trim().slice(0, 500),
+        supportTelegramUrl: settingsForm.supportTelegramUrl.trim().slice(0, 300),
+        supportWhatsapp: settingsForm.supportWhatsapp.trim().slice(0, 300),
+        supportedMethods: settingsForm.supportedMethods.slice(0, 10),
+        customDomain: normalizedCustomDomain.slice(0, 180),
+        updatedAt: serverTimestamp(),
+      };
+
+      try {
+        await setDoc(doc(db, 'site_settings', 'global'), cleanSettings);
+      } catch (err) {
+        setErrorMessage(logFirestoreError(err, OperationType.WRITE, 'site_settings/global'));
+        return;
+      }
+
+      for (const b of batches) {
+        try {
+          const createdAt = await resolveExistingCreatedAt('batches', b.id);
+          const bw = writeBatch(db);
+          bw.set(doc(db, 'batches', b.id), {
+            title: String(b.title || '').slice(0, 140),
+            subtitle: String(b.subtitle || '').slice(0, 240),
+            description: String(b.description || '').slice(0, 2000),
+            category: String(b.category || 'Batch').slice(0, 60),
+            instructor: String(b.instructor || '').slice(0, 80),
+            price: Math.max(0, Number(b.price) || 0),
+            originalPrice: Math.max(0, Number(b.originalPrice) || 0),
+            thumbnailUrl: String(b.thumbnailUrl || '').slice(0, 500000),
+            thumbnailSize: b.thumbnailSize || 'standard',
+            thumbnailAspect: b.thumbnailAspect || '16:9',
+            glowAccent: b.glowAccent || 'amber',
+            openType: b.openType || 'webview',
+            isActive: b.isActive !== false,
+            isFeatured: Boolean(b.isFeatured),
+            showCheckmark: b.showCheckmark !== false,
+            requirePayment: b.requirePayment !== false && Number(b.price) > 0,
+            plan1Label: String(b.plan1Label || '1 Year').slice(0, 40),
+            plan2Label: String(b.plan2Label || '2 Years').slice(0, 40),
+            plan2Price:
+              typeof b.plan2Price === 'number'
+                ? Math.max(0, b.plan2Price)
+                : Math.max(0, (Number(b.price) || 0) + 10),
+            plan3Label: String(b.plan3Label || 'Lifetime').slice(0, 40),
+            plan3Price:
+              typeof b.plan3Price === 'number'
+                ? Math.max(0, b.plan3Price)
+                : Math.max(0, (Number(b.price) || 0) + 20),
+            displayOrder: Math.max(0, Number(b.displayOrder) || 1),
+            createdAt,
+            updatedAt: serverTimestamp(),
+          });
+          const sec = secretTargets[b.id];
+          if (sec?.targetUrl) {
+            bw.set(doc(db, 'batches', b.id, 'private', 'access'), {
+              targetUrl: sec.targetUrl.slice(0, 1000),
+              accessInstructions: String(sec.accessInstructions || '').slice(0, 1000),
+              updatedAt: serverTimestamp(),
+            });
+          }
+          await bw.commit();
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.WRITE, `batches/${b.id}`));
+          return;
+        }
+      }
+
+      for (const o of offers) {
+        try {
+          const createdAt = await resolveExistingCreatedAt('offers', o.id);
+          await setDoc(doc(db, 'offers', o.id), {
+            title: String(o.title || '').slice(0, 120),
+            badge: String(o.badge || '').slice(0, 40),
+            description: String(o.description || '').slice(0, 300),
+            isActive: o.isActive !== false,
+            displayOrder: Math.max(0, Number(o.displayOrder) || 1),
+            createdAt,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.WRITE, `offers/${o.id}`));
+          return;
+        }
+      }
+
+      showToast(
+        `All ${batches.length} batches, ${offers.length} offers & settings synced LIVE to khatushyamlearning.vercel.app!`,
+      );
+    } finally {
+      setPushingToVercel(false);
     }
   };
 
@@ -428,11 +793,7 @@ export function AdminPanel({
         const res = await fetch('/api/thumbnail-copy', {
           method: 'POST',
           credentials: 'same-origin',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-KSL-Client': 'ksl-v1',
-            ...(adminToken ? { 'X-Admin-Session': adminToken } : {}),
-          },
+          headers: adminHeaders(),
           body: JSON.stringify({
             title: batchForm.title,
             glowAccent: batchForm.glowAccent,
@@ -470,23 +831,37 @@ export function AdminPanel({
   const handleEditBatch = async (batch: Batch) => {
     setEditingId(batch.id);
     setActiveTab('batches');
-    let targetUrl = '';
-    let accessInstructions = '';
-    if (user && isDbAdmin) {
+    const localSecret = secretTargets[batch.id];
+    let targetUrl = String(localSecret?.targetUrl || '');
+    let accessInstructions = String(localSecret?.accessInstructions || '');
+
+    if (!targetUrl && user && isDbAdmin) {
       try {
         const secretSnap = await getDoc(doc(db, 'batches', batch.id, 'private', 'access'));
         if (secretSnap.exists()) {
           const d = secretSnap.data();
           targetUrl = String(d.targetUrl || '');
           accessInstructions = String(d.accessInstructions || '');
+          if (targetUrl) {
+            setSecretTargets((prev) => ({
+              ...prev,
+              [batch.id]: { targetUrl, accessInstructions },
+            }));
+            void fetch('/api/admin/merge-cache', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: adminHeaders(),
+              body: JSON.stringify({
+                batchSecrets: {
+                  [batch.id]: { targetUrl, accessInstructions },
+                },
+              }),
+            }).catch(() => {});
+          }
         }
       } catch (err) {
-        setErrorMessage(
-          logFirestoreError(err, OperationType.GET, `batches/${batch.id}/private/access`),
-        );
+        setErrorMessage(logFirestoreError(err, OperationType.GET, `batches/${batch.id}/private/access`));
       }
-    } else {
-      ensureDbWriteAccess();
     }
 
     setBatchForm({
@@ -525,7 +900,7 @@ export function AdminPanel({
     setErrorMessage('');
 
     const trimmedTitle = batchForm.title.trim();
-    const trimmedTargetUrl = batchForm.targetUrl.trim();
+    let trimmedTargetUrl = batchForm.targetUrl.trim();
 
     if (!trimmedTitle) {
       setErrorMessage('Batch Name is required.');
@@ -535,15 +910,24 @@ export function AdminPanel({
       setErrorMessage('Target URL (WebView / Website / Telegram link) is required.');
       return;
     }
-    if (!/^https?:\/\//i.test(trimmedTargetUrl)) {
-      setErrorMessage('Target URL must start with https:// or http://');
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmedTargetUrl)) {
+      trimmedTargetUrl = `https://${trimmedTargetUrl.replace(/^\/+/, '')}`;
+    }
+    try {
+      const parsedUrl = new URL(trimmedTargetUrl);
+      if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+        setErrorMessage('Target URL must use https:// or http://');
+        return;
+      }
+      trimmedTargetUrl = parsedUrl.toString();
+    } catch {
+      setErrorMessage('Enter a valid URL (e.g. https://t.me/... or https://example.com)');
       return;
     }
     if (batchForm.thumbnailUrl.length > 495000) {
       setErrorMessage('Thumbnail image is too large. Please re-upload a smaller image or click Generate Thumbnail.');
       return;
     }
-    if (!ensureDbWriteAccess()) return;
 
     const batchId =
       editingId ||
@@ -553,113 +937,201 @@ export function AdminPanel({
         .replace(/^_|_$/g, '')
         .slice(0, 32)}_${Date.now().toString(36)}`;
 
+    const numericPrice = batchForm.requirePayment
+      ? Math.max(0, Number(batchForm.price) || 0)
+      : 0;
+    const finalRequirePayment = batchForm.requirePayment && numericPrice > 0;
+    const numericPlan2Price = finalRequirePayment
+      ? Math.max(0, Number(batchForm.plan2Price) || numericPrice + 10)
+      : 0;
+    const numericPlan3Price = finalRequirePayment
+      ? Math.max(0, Number(batchForm.plan3Price) || numericPrice + 20)
+      : 0;
+
+    const existingBatch = batches.find((b) => b.id === batchId);
+
+    const nextBatchPayload: Batch = {
+      id: batchId,
+      title: trimmedTitle.slice(0, 140),
+      subtitle: '',
+      description: '',
+      category: 'Batch',
+      instructor: '',
+      price: numericPrice,
+      originalPrice: Math.max(0, Number(batchForm.originalPrice) || 0),
+      thumbnailUrl: batchForm.thumbnailUrl,
+      thumbnailSize: batchForm.thumbnailSize,
+      thumbnailAspect: batchForm.thumbnailAspect,
+      glowAccent: batchForm.glowAccent,
+      openType: batchForm.openType,
+      isActive: batchForm.isActive,
+      isFeatured: batchForm.isFeatured,
+      showCheckmark: batchForm.showCheckmark,
+      requirePayment: finalRequirePayment,
+      plan1Label: (batchForm.plan1Label.trim() || '1 Year').slice(0, 40),
+      plan2Label: (batchForm.plan2Label.trim() || '2 Years').slice(0, 40),
+      plan2Price: numericPlan2Price,
+      plan3Label: (batchForm.plan3Label.trim() || 'Lifetime').slice(0, 40),
+      plan3Price: numericPlan3Price,
+      displayOrder: Math.max(0, Number(batchForm.displayOrder) || 1),
+    };
+
+    const safeTargetUrl = trimmedTargetUrl.slice(0, 1000);
+    const safeInstructions = batchForm.accessInstructions.trim().slice(0, 1000);
+
     setSavingBatch(true);
     try {
-      const bw = writeBatch(db);
-      const batchRef = doc(db, 'batches', batchId);
-      const secretRef = doc(db, 'batches', batchId, 'private', 'access');
-
-      const existingBatch = batches.find((b) => b.id === batchId);
-
-      const numericPrice = batchForm.requirePayment
-        ? Math.max(0, Number(batchForm.price) || 0)
-        : 0;
-      const finalRequirePayment = batchForm.requirePayment && numericPrice > 0;
-      const numericPlan2Price = finalRequirePayment
-        ? Math.max(0, Number(batchForm.plan2Price) || numericPrice + 10)
-        : 0;
-      const numericPlan3Price = finalRequirePayment
-        ? Math.max(0, Number(batchForm.plan3Price) || numericPrice + 20)
-        : 0;
-
-      const nextBatchPayload: Batch = {
-        id: batchId,
-        title: trimmedTitle.slice(0, 140),
-        subtitle: '',
-        description: '',
-        category: 'Batch',
-        instructor: '',
-        price: numericPrice,
-        originalPrice: Math.max(0, Number(batchForm.originalPrice) || 0),
-        thumbnailUrl: batchForm.thumbnailUrl,
-        thumbnailSize: batchForm.thumbnailSize,
-        thumbnailAspect: batchForm.thumbnailAspect,
-        glowAccent: batchForm.glowAccent,
-        openType: batchForm.openType,
-        isActive: batchForm.isActive,
-        isFeatured: batchForm.isFeatured,
-        showCheckmark: batchForm.showCheckmark,
-        requirePayment: finalRequirePayment,
-        plan1Label: (batchForm.plan1Label.trim() || '1 Year').slice(0, 40),
-        plan2Label: (batchForm.plan2Label.trim() || '2 Years').slice(0, 40),
-        plan2Price: numericPlan2Price,
-        plan3Label: (batchForm.plan3Label.trim() || 'Lifetime').slice(0, 40),
-        plan3Price: numericPlan3Price,
-        displayOrder: Math.max(0, Number(batchForm.displayOrder) || 1),
+      const res = await fetch('/api/admin/batches', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: adminHeaders(),
+        body: JSON.stringify({
+          batch: nextBatchPayload,
+          targetUrl: safeTargetUrl,
+          accessInstructions: safeInstructions,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        batches?: Batch[];
       };
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok || !data.ok) {
+        setErrorMessage(data.error || `Could not publish batch (HTTP ${res.status}).`);
+        return;
+      }
 
-      bw.set(batchRef, {
-        title: nextBatchPayload.title,
-        subtitle: nextBatchPayload.subtitle,
-        description: nextBatchPayload.description,
-        category: nextBatchPayload.category,
-        instructor: nextBatchPayload.instructor,
-        price: nextBatchPayload.price,
-        originalPrice: nextBatchPayload.originalPrice,
-        thumbnailUrl: nextBatchPayload.thumbnailUrl,
-        thumbnailSize: nextBatchPayload.thumbnailSize,
-        thumbnailAspect: nextBatchPayload.thumbnailAspect,
-        glowAccent: nextBatchPayload.glowAccent,
-        openType: nextBatchPayload.openType,
-        isActive: nextBatchPayload.isActive,
-        isFeatured: nextBatchPayload.isFeatured,
-        showCheckmark: nextBatchPayload.showCheckmark,
-        requirePayment: nextBatchPayload.requirePayment,
-        plan1Label: nextBatchPayload.plan1Label,
-        plan2Label: nextBatchPayload.plan2Label,
-        plan2Price: nextBatchPayload.plan2Price,
-        plan3Label: nextBatchPayload.plan3Label,
-        plan3Price: nextBatchPayload.plan3Price,
-        displayOrder: nextBatchPayload.displayOrder,
-        createdAt: existingBatch?.createdAt || serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      setSecretTargets((prev) => ({
+        ...prev,
+        [batchId]: { targetUrl: safeTargetUrl, accessInstructions: safeInstructions },
+      }));
+      onSyncCatalog?.({
+        batches: Array.isArray(data.batches)
+          ? data.batches
+          : existingBatch
+            ? batches.map((b) => (b.id === batchId ? nextBatchPayload : b))
+            : [...batches, nextBatchPayload],
+        offers,
+        settings,
       });
 
-      bw.set(secretRef, {
-        targetUrl: trimmedTargetUrl.slice(0, 1000),
-        accessInstructions: batchForm.accessInstructions.trim().slice(0, 1000),
-        updatedAt: serverTimestamp(),
-      });
-
-      await bw.commit();
-      const updatedBatches = existingBatch
-        ? batches.map((b) => (b.id === batchId ? nextBatchPayload : b))
-        : [...batches, nextBatchPayload];
-      void pushCatalogSnapshot({ batches: updatedBatches, offers, settings });
       setBatchForm(EMPTY_BATCH_FORM);
       setEditingId(null);
-      showToast(editingId ? 'Batch updated successfully!' : 'Batch published to website successfully!');
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.WRITE, `batches/${batchId}`));
+
+      // Sync directly to Firestore so https://khatushyamlearning.vercel.app/ updates immediately
+      if (user && isDbAdmin) {
+        try {
+          const resolvedCreatedAt = await resolveExistingCreatedAt('batches', batchId);
+          const bw = writeBatch(db);
+          bw.set(doc(db, 'batches', batchId), {
+            title: nextBatchPayload.title,
+            subtitle: nextBatchPayload.subtitle,
+            description: nextBatchPayload.description,
+            category: nextBatchPayload.category,
+            instructor: nextBatchPayload.instructor,
+            price: nextBatchPayload.price,
+            originalPrice: nextBatchPayload.originalPrice,
+            thumbnailUrl: nextBatchPayload.thumbnailUrl,
+            thumbnailSize: nextBatchPayload.thumbnailSize,
+            thumbnailAspect: nextBatchPayload.thumbnailAspect,
+            glowAccent: nextBatchPayload.glowAccent,
+            openType: nextBatchPayload.openType,
+            isActive: nextBatchPayload.isActive,
+            isFeatured: nextBatchPayload.isFeatured,
+            showCheckmark: nextBatchPayload.showCheckmark,
+            requirePayment: nextBatchPayload.requirePayment,
+            plan1Label: nextBatchPayload.plan1Label,
+            plan2Label: nextBatchPayload.plan2Label,
+            plan2Price: nextBatchPayload.plan2Price,
+            plan3Label: nextBatchPayload.plan3Label,
+            plan3Price: nextBatchPayload.plan3Price,
+            displayOrder: nextBatchPayload.displayOrder,
+            createdAt: resolvedCreatedAt,
+            updatedAt: serverTimestamp(),
+          });
+          bw.set(doc(db, 'batches', batchId, 'private', 'access'), {
+            targetUrl: safeTargetUrl,
+            accessInstructions: safeInstructions,
+            updatedAt: serverTimestamp(),
+          });
+          await bw.commit();
+          showToast(
+            editingId
+              ? 'Batch updated LIVE on App & khatushyamlearning.vercel.app!'
+              : 'Batch published LIVE on App & khatushyamlearning.vercel.app!',
+          );
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.WRITE, `batches/${batchId}`));
+        }
+      } else {
+        showToast(
+          'Saved locally! Click "Connect Vercel Sync" above to push this batch live to khatushyamlearning.vercel.app.',
+        );
+      }
+    } catch {
+      setErrorMessage('Server connection error while saving batch.');
     } finally {
       setSavingBatch(false);
     }
   };
 
   const handleDeleteBatch = async (batchId: string) => {
-    if (!ensureDbWriteAccess()) return;
+    setErrorMessage('');
     try {
-      await deleteDoc(doc(db, 'batches', batchId, 'private', 'access'));
-      await deleteDoc(doc(db, 'batches', batchId));
-      const updatedBatches = batches.filter((b) => b.id !== batchId);
-      void pushCatalogSnapshot({ batches: updatedBatches, offers, settings });
+      const res = await fetch(`/api/admin/batches/${encodeURIComponent(batchId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: adminHeaders(false),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        batches?: Batch[];
+      };
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok || !data.ok) {
+        setErrorMessage(data.error || 'Could not delete batch.');
+        return;
+      }
+
+      setSecretTargets((prev) => {
+        const next = { ...prev };
+        delete next[batchId];
+        return next;
+      });
+      onSyncCatalog?.({
+        batches: Array.isArray(data.batches)
+          ? data.batches
+          : batches.filter((b) => b.id !== batchId),
+        offers,
+        settings,
+      });
+
       if (editingId === batchId) {
         setEditingId(null);
         setBatchForm(EMPTY_BATCH_FORM);
       }
-      showToast('Batch deleted.');
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.DELETE, `batches/${batchId}`));
+
+      if (user && isDbAdmin) {
+        try {
+          await deleteDoc(doc(db, 'batches', batchId, 'private', 'access'));
+          await deleteDoc(doc(db, 'batches', batchId));
+          showToast('Batch deleted LIVE from App & khatushyamlearning.vercel.app.');
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.DELETE, `batches/${batchId}`));
+        }
+      } else {
+        showToast('Deleted locally. Click "Connect Vercel Sync" above to delete from khatushyamlearning.vercel.app.');
+      }
+    } catch {
+      setErrorMessage('Server connection error while deleting batch.');
     }
   };
 
@@ -670,7 +1142,6 @@ export function AdminPanel({
       setErrorMessage('Offer title is required.');
       return;
     }
-    if (!ensureDbWriteAccess()) return;
     const offerId =
       editingOfferId ||
       `offer_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -685,19 +1156,36 @@ export function AdminPanel({
         isActive: offerForm.isActive,
         displayOrder: Math.max(0, Number(offerForm.displayOrder) || 1),
       };
-      await setDoc(doc(db, 'offers', offerId), {
-        title: nextOffer.title,
-        badge: nextOffer.badge,
-        description: nextOffer.description,
-        isActive: nextOffer.isActive,
-        displayOrder: nextOffer.displayOrder,
-        createdAt: existingOffer?.createdAt || serverTimestamp(),
-        updatedAt: serverTimestamp(),
+
+      const res = await fetch('/api/admin/offers', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: adminHeaders(),
+        body: JSON.stringify({ offer: nextOffer }),
       });
-      const updatedOffers = existingOffer
-        ? offers.map((o) => (o.id === offerId ? nextOffer : o))
-        : [...offers, nextOffer];
-      void pushCatalogSnapshot({ batches, offers: updatedOffers, settings });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        offers?: Offer[];
+      };
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok || !data.ok) {
+        setErrorMessage(data.error || 'Could not publish offer.');
+        return;
+      }
+
+      onSyncCatalog?.({
+        batches,
+        offers: Array.isArray(data.offers)
+          ? data.offers
+          : existingOffer
+            ? offers.map((o) => (o.id === offerId ? nextOffer : o))
+            : [...offers, nextOffer],
+        settings,
+      });
       setOfferForm({
         title: '',
         badge: 'LIMITED',
@@ -706,20 +1194,60 @@ export function AdminPanel({
         displayOrder: '1',
       });
       setEditingOfferId(null);
-      showToast(editingOfferId ? 'Offer updated.' : 'Limited Offer published to Storefront.');
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.WRITE, `offers/${offerId}`));
+
+      if (user && isDbAdmin) {
+        try {
+          const resolvedCreatedAt = await resolveExistingCreatedAt('offers', offerId);
+          await setDoc(doc(db, 'offers', offerId), {
+            title: nextOffer.title,
+            badge: nextOffer.badge,
+            description: nextOffer.description,
+            isActive: nextOffer.isActive,
+            displayOrder: nextOffer.displayOrder,
+            createdAt: resolvedCreatedAt,
+            updatedAt: serverTimestamp(),
+          });
+          showToast(
+            editingOfferId
+              ? 'Offer updated LIVE on App & khatushyamlearning.vercel.app!'
+              : 'Limited Offer published LIVE on App & khatushyamlearning.vercel.app!',
+          );
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.WRITE, `offers/${offerId}`));
+        }
+      } else {
+        showToast('Offer saved locally. Click "Connect Vercel Sync" above to push live to khatushyamlearning.vercel.app.');
+      }
+    } catch {
+      setErrorMessage('Server connection error while saving offer.');
     } finally {
       setSavingOffer(false);
     }
   };
 
   const handleDeleteOffer = async (offerId: string) => {
-    if (!ensureDbWriteAccess()) return;
+    setErrorMessage('');
     try {
-      await deleteDoc(doc(db, 'offers', offerId));
-      const updatedOffers = offers.filter((o) => o.id !== offerId);
-      void pushCatalogSnapshot({ batches, offers: updatedOffers, settings });
+      const res = await fetch(`/api/admin/offers/${encodeURIComponent(offerId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: adminHeaders(false),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        offers?: Offer[];
+      };
+      if (!res.ok || !data.ok) {
+        setErrorMessage(data.error || 'Could not delete offer.');
+        return;
+      }
+
+      onSyncCatalog?.({
+        batches,
+        offers: Array.isArray(data.offers) ? data.offers : offers.filter((o) => o.id !== offerId),
+        settings,
+      });
       if (editingOfferId === offerId) {
         setEditingOfferId(null);
         setOfferForm({
@@ -730,62 +1258,152 @@ export function AdminPanel({
           displayOrder: '1',
         });
       }
-      showToast('Offer deleted.');
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.DELETE, `offers/${offerId}`));
+
+      if (user && isDbAdmin) {
+        try {
+          await deleteDoc(doc(db, 'offers', offerId));
+          showToast('Offer deleted LIVE from App & khatushyamlearning.vercel.app.');
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.DELETE, `offers/${offerId}`));
+        }
+      } else {
+        showToast('Offer deleted locally. Click "Connect Vercel Sync" above to delete from khatushyamlearning.vercel.app.');
+      }
+    } catch {
+      setErrorMessage('Server connection error while deleting offer.');
     }
   };
 
   const handleApproveOrder = async (order: Order) => {
-    if (!ensureDbWriteAccess()) return;
+    setErrorMessage('');
     try {
-      const secretSnap = await getDoc(doc(db, 'batches', order.batchId, 'private', 'access'));
-      const secretData = secretSnap.exists() ? secretSnap.data() : {};
-      const matchedBatch = batches.find((b) => b.id === order.batchId);
+      const adminNote = (adminRemarks[order.id] || 'Verified & Approved').slice(0, 500);
+      let resolvedUrl = String(secretTargets[order.batchId]?.targetUrl || '').trim();
+      let resolvedInstructions = String(secretTargets[order.batchId]?.accessInstructions || '').trim();
 
-      const targetUrl = String(secretData.targetUrl || '');
-      const accessInstructions = String(
-        secretData.accessInstructions ||
-          'Approved by Admin. Click the launch button below to access your batch.',
-      );
+      if (!resolvedUrl && user && isDbAdmin) {
+        try {
+          const secSnap = await getDoc(doc(db, 'batches', order.batchId, 'private', 'access'));
+          if (secSnap.exists()) {
+            const sd = secSnap.data();
+            resolvedUrl = String(sd.targetUrl || '').trim();
+            resolvedInstructions = String(sd.accessInstructions || '').trim();
+          }
+        } catch {
+          // continue cleanly
+        }
+      }
 
-      await setDoc(
-        doc(db, 'orders', order.id),
-        {
+      const batchObj = batches.find((b) => b.id === order.batchId);
+      const finalOpenType = batchObj?.openType || order.openType || 'webview';
+      const finalInstructions = (
+        resolvedInstructions || 'Approved by Admin. Click the launch button below to access your batch.'
+      ).slice(0, 1000);
+
+      const res = await fetch(`/api/admin/orders/${encodeURIComponent(order.id)}/decision`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: adminHeaders(),
+        body: JSON.stringify({
           status: 'approved',
-          adminNote: (adminRemarks[order.id] || 'Verified & Approved').slice(0, 500),
-          openType: matchedBatch?.openType || order.openType,
-          unlockedUrl: targetUrl.slice(0, 1000),
-          unlockedInstructions: accessInstructions.slice(0, 1000),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
-      showToast(`Approved ${order.studentName} for ${order.batchTitle}`);
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`));
+          adminNote,
+          order,
+          unlockedUrl: resolvedUrl,
+          unlockedInstructions: finalInstructions,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        order?: Order;
+        orders?: Order[];
+      };
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (res.ok && data.ok) {
+        if (Array.isArray(data.orders)) {
+          setServerOrders(data.orders);
+        } else if (data.order) {
+          setServerOrders((prev) => prev.map((o) => (o.id === order.id ? data.order! : o)));
+        }
+      }
+
+      if (user && isDbAdmin) {
+        try {
+          await updateDoc(doc(db, 'orders', order.id), {
+            status: 'approved',
+            adminNote,
+            openType: data.order?.openType || finalOpenType,
+            unlockedUrl: (data.order?.unlockedUrl || resolvedUrl).slice(0, 1000),
+            unlockedInstructions: (data.order?.unlockedInstructions || finalInstructions).slice(0, 1000),
+            updatedAt: serverTimestamp(),
+          });
+          showToast(`Approved ${order.studentName} LIVE on App & khatushyamlearning.vercel.app!`);
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`));
+        }
+      } else if (res.ok && data.ok) {
+        showToast(`Approved ${order.studentName} locally. Connect Vercel Sync above to approve on Vercel.`);
+      } else {
+        setErrorMessage(data.error || 'Could not approve order.');
+      }
+    } catch {
+      setErrorMessage('Server connection error while approving order.');
     }
   };
 
   const handleRejectOrder = async (order: Order) => {
-    if (!ensureDbWriteAccess()) return;
+    setErrorMessage('');
     try {
-      await setDoc(
-        doc(db, 'orders', order.id),
-        {
-          status: 'rejected',
-          adminNote: (
-            adminRemarks[order.id] || 'Payment UTR could not be verified. Contact support.'
-          ).slice(0, 500),
-          unlockedUrl: '',
-          unlockedInstructions: '',
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
-      showToast(`Declined order from ${order.studentName}`);
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`));
+      const adminNote = (
+        adminRemarks[order.id] || 'Payment UTR could not be verified. Contact support.'
+      ).slice(0, 500);
+      const res = await fetch(`/api/admin/orders/${encodeURIComponent(order.id)}/decision`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: adminHeaders(),
+        body: JSON.stringify({ status: 'rejected', adminNote, order }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        order?: Order;
+        orders?: Order[];
+      };
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (res.ok && data.ok) {
+        if (Array.isArray(data.orders)) {
+          setServerOrders(data.orders);
+        } else if (data.order) {
+          setServerOrders((prev) => prev.map((o) => (o.id === order.id ? data.order! : o)));
+        }
+      }
+
+      if (user && isDbAdmin) {
+        try {
+          await updateDoc(doc(db, 'orders', order.id), {
+            status: 'rejected',
+            adminNote,
+            unlockedUrl: '',
+            unlockedInstructions: '',
+            updatedAt: serverTimestamp(),
+          });
+          showToast(`Declined order from ${order.studentName} LIVE.`);
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.UPDATE, `orders/${order.id}`));
+        }
+      } else if (res.ok && data.ok) {
+        showToast(`Declined ${order.studentName} locally. Connect Vercel Sync above to update Vercel.`);
+      } else {
+        setErrorMessage(data.error || 'Could not reject order.');
+      }
+    } catch {
+      setErrorMessage('Server connection error while rejecting order.');
     }
   };
 
@@ -803,11 +1421,7 @@ export function AdminPanel({
       const res = await fetch('/api/admin/check-domain', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-KSL-Client': 'ksl-v1',
-          ...(adminToken ? { 'X-Admin-Session': adminToken } : {}),
-        },
+        headers: adminHeaders(),
         body: JSON.stringify({ domain: cleaned }),
       });
       const data = await res.json().catch(() => ({}));
@@ -827,10 +1441,6 @@ export function AdminPanel({
     e.preventDefault();
     setSavingSettings(true);
     setErrorMessage('');
-    if (!ensureDbWriteAccess()) {
-      setSavingSettings(false);
-      return;
-    }
     const rawCustomDomain = (settingsForm.customDomain || '').trim();
     const normalizedCustomDomain = rawCustomDomain ? normalizeCustomDomain(rawCustomDomain) : '';
     if (rawCustomDomain && !normalizedCustomDomain) {
@@ -860,19 +1470,49 @@ export function AdminPanel({
         paymentInstructions: settingsForm.paymentInstructions.trim().slice(0, 600),
         gatewayPaymentUrl: settingsForm.gatewayPaymentUrl.trim().slice(0, 500),
         supportTelegramUrl: settingsForm.supportTelegramUrl.trim().slice(0, 300),
-        supportWhatsapp: settingsForm.supportWhatsapp.trim().slice(0, 40),
+        supportWhatsapp: settingsForm.supportWhatsapp.trim().slice(0, 300),
         supportedMethods: settingsForm.supportedMethods.slice(0, 10),
         customDomain: normalizedCustomDomain.slice(0, 180),
       };
-      await setDoc(doc(db, 'site_settings', 'global'), {
-        ...savedSettings,
-        updatedAt: serverTimestamp(),
+
+      const res = await fetch('/api/admin/settings', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: adminHeaders(),
+        body: JSON.stringify({ settings: savedSettings }),
       });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        settings?: SiteSettings;
+      };
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok || !data.ok) {
+        setErrorMessage(data.error || 'Could not save settings.');
+        return;
+      }
+
       setSettingsForm((prev) => ({ ...prev, customDomain: normalizedCustomDomain }));
-      void pushCatalogSnapshot({ batches, offers, settings: savedSettings });
-      showToast('Storefront, custom domain & payment settings saved.');
-    } catch (err) {
-      setErrorMessage(logFirestoreError(err, OperationType.WRITE, 'site_settings/global'));
+      onSyncCatalog?.({ batches, offers, settings: data.settings || savedSettings });
+
+      if (user && isDbAdmin) {
+        try {
+          await setDoc(doc(db, 'site_settings', 'global'), {
+            ...savedSettings,
+            updatedAt: serverTimestamp(),
+          });
+          showToast('Storefront, custom domain & payment settings saved LIVE to khatushyamlearning.vercel.app!');
+        } catch (err) {
+          setErrorMessage(logFirestoreError(err, OperationType.WRITE, 'site_settings/global'));
+        }
+      } else {
+        showToast('Settings saved locally. Click "Connect Vercel Sync" above to push live to khatushyamlearning.vercel.app.');
+      }
+    } catch {
+      setErrorMessage('Server connection error while saving settings.');
     } finally {
       setSavingSettings(false);
     }
@@ -926,25 +1566,25 @@ export function AdminPanel({
     });
   }, [allOrders, orderFilter, orderSearch]);
 
-  // Reusable glowing input & panel classes matching Storefront
+  // Reusable ultra-dark neon input & panel classes
   const glowInputClass =
-    'w-full px-3.5 py-2.5 rounded-xl bg-[#070911]/95 border border-pink-300/30 text-sm text-white placeholder:text-zinc-400 focus:outline-none focus:border-lime-300 focus:shadow-[0_0_20px_-6px_rgba(74,222,128,0.55)] transition-all';
+    'w-full px-3.5 py-2.5 rounded-xl bg-[#070911] border border-pink-300/30 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-pink-300 focus:shadow-[0_0_20px_-6px_rgba(244,114,182,0.55)] transition-all';
   const glowCompactInputClass =
-    'w-full px-3 py-2 rounded-xl bg-[#070911]/95 border border-cyan-300/30 text-xs text-white placeholder:text-zinc-400 focus:outline-none focus:border-lime-300 focus:shadow-[0_0_18px_-6px_rgba(74,222,128,0.5)] transition-all';
+    'w-full px-3 py-2 rounded-xl bg-[#070911] border border-white/15 text-xs text-white placeholder:text-zinc-500 focus:outline-none focus:border-lime-300 focus:shadow-[0_0_18px_-6px_rgba(74,222,128,0.5)] transition-all';
   const glowCardClass =
-    'relative rounded-2xl hd-glass-surface border border-pink-300/35 shadow-[0_0_48px_-14px_rgba(244,114,182,0.42),0_0_36px_-14px_rgba(74,222,128,0.3)] overflow-hidden';
+    'relative rounded-3xl hd-glass-surface border border-pink-300/35 shadow-[0_0_48px_-14px_rgba(244,114,182,0.3)] overflow-hidden';
   const glowPrimaryBtnClass =
-    'inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:from-pink-300 hover:via-amber-200 hover:to-lime-200 text-zinc-950 text-xs font-extrabold transition-all shadow-[0_0_30px_rgba(244,114,182,0.5),0_0_20px_rgba(74,222,128,0.38)] ring-1 ring-white/40 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60';
+    'inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 hover:brightness-105 text-zinc-950 text-xs font-extrabold transition-all shadow-[0_0_26px_-4px_rgba(244,114,182,0.55)] whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60';
 
   // Separate Admin Gate Screen (Opens directly with server-verified Access Code)
   if (checkingSession) {
     return (
-      <div className="min-h-screen bg-[#030307] text-zinc-100 flex items-center justify-center p-4 relative overflow-hidden">
+      <div className="min-h-screen bg-[#030307] dark-hd-studio text-zinc-100 flex items-center justify-center p-4 relative overflow-hidden">
         <div className="pointer-events-none fixed inset-0 z-0">
-          <div className="absolute -top-36 left-1/4 w-[520px] h-[320px] rounded-full blur-[150px] bg-pink-500/25" />
-          <div className="absolute bottom-0 right-1/4 w-[520px] h-[320px] rounded-full blur-[150px] bg-lime-400/20" />
+          <div className="absolute -top-36 left-1/4 w-[520px] h-[320px] rounded-full blur-[150px] bg-pink-500/18" />
+          <div className="absolute bottom-0 right-1/4 w-[520px] h-[320px] rounded-full blur-[150px] bg-lime-400/14" />
         </div>
-        <div className="relative z-10 px-6 py-3.5 rounded-2xl hd-glass-surface border border-pink-400/45 shadow-[0_0_36px_rgba(244,114,182,0.45)] text-xs font-bold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent tracking-wide">
+        <div className="relative z-10 px-6 py-3.5 rounded-2xl hd-glass-surface border border-pink-300/45 shadow-[0_0_36px_rgba(244,114,182,0.38)] text-xs font-extrabold text-pink-200 tracking-wide">
           Verifying secure session...
         </div>
       </div>
@@ -953,15 +1593,15 @@ export function AdminPanel({
 
   if (!unlocked) {
     return (
-      <div className="min-h-screen bg-[#030307] text-zinc-100 flex items-center justify-center p-4 relative overflow-hidden">
+      <div className="min-h-screen bg-[#030307] dark-hd-studio text-zinc-100 flex items-center justify-center p-4 relative overflow-hidden">
         <div className="pointer-events-none fixed inset-0 z-0">
-          <div className="absolute -top-36 left-1/4 w-[580px] h-[360px] rounded-full blur-[150px] bg-pink-500/25" />
-          <div className="absolute -bottom-32 right-1/4 w-[580px] h-[360px] rounded-full blur-[150px] bg-lime-400/20" />
-          <div className="absolute top-1/2 -left-24 w-[400px] h-[400px] rounded-full blur-[160px] bg-cyan-400/15" />
+          <div className="absolute -top-36 left-1/4 w-[580px] h-[360px] rounded-full blur-[150px] bg-pink-500/20" />
+          <div className="absolute -bottom-32 right-1/4 w-[580px] h-[360px] rounded-full blur-[150px] bg-lime-400/15" />
+          <div className="absolute top-1/2 -left-24 w-[400px] h-[400px] rounded-full blur-[160px] bg-cyan-400/12" />
         </div>
 
-        <div className="relative z-10 max-w-md w-full rounded-3xl hd-glass-surface border border-pink-400/50 p-7 space-y-6 shadow-[0_0_72px_-10px_rgba(244,114,182,0.55),0_0_54px_-12px_rgba(74,222,128,0.45)] overflow-hidden">
-          <span className="pointer-events-none absolute inset-x-0 top-0 h-[2.5px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
+        <div className="relative z-10 max-w-md w-full rounded-3xl hd-glass-surface border border-pink-300/45 p-7 space-y-6 shadow-[0_0_72px_-10px_rgba(244,114,182,0.45),0_0_54px_-12px_rgba(74,222,128,0.28)] overflow-hidden">
+          <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2 min-w-0">
               <span className="font-display text-lg font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent truncate">
@@ -972,17 +1612,17 @@ export function AdminPanel({
             <button
               type="button"
               onClick={onBackToStorefront}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-cyan-300/35 text-xs font-semibold text-cyan-200 hover:text-white transition-colors shrink-0"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/[0.05] hover:bg-white/10 border border-white/15 text-xs font-semibold text-zinc-200 hover:text-white transition-colors shrink-0 cursor-pointer"
             >
               <ArrowLeft className="w-3.5 h-3.5" /> Storefront
             </button>
           </div>
 
           <div className="space-y-1">
-            <h1 className="font-display text-2xl font-extrabold bg-gradient-to-r from-white via-pink-100 to-lime-200 bg-clip-text text-transparent">
+            <h1 className="font-display text-2xl font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent">
               Personal Admin Panel
             </h1>
-            <p className="text-xs text-zinc-300">
+            <p className="text-xs text-zinc-400">
               Enter your private Admin Access Code to open the control panel.
             </p>
           </div>
@@ -993,7 +1633,7 @@ export function AdminPanel({
                 Admin Access Code
               </label>
               <div className="relative">
-                <KeyRound className="w-4 h-4 text-lime-300 absolute left-3.5 top-1/2 -translate-y-1/2 drop-shadow-[0_0_8px_rgba(74,222,128,0.8)]" />
+                <KeyRound className="w-4 h-4 text-pink-300 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
                   type="password"
                   required
@@ -1001,19 +1641,19 @@ export function AdminPanel({
                   value={codeInput}
                   onChange={(e) => setCodeInput(e.target.value)}
                   placeholder="Enter access code"
-                  className="w-full pl-10 pr-4 py-3 rounded-xl bg-[#070911]/95 border border-pink-300/45 text-sm text-white placeholder:text-zinc-400 focus:outline-none focus:border-lime-300 focus:shadow-[0_0_24px_-6px_rgba(74,222,128,0.65)] transition-all"
+                  className="w-full pl-10 pr-4 py-3 rounded-xl bg-[#070911] border border-pink-300/40 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-lime-300 focus:shadow-[0_0_24px_-6px_rgba(74,222,128,0.55)] transition-all"
                 />
               </div>
             </div>
             {codeError && (
-              <p className="text-xs font-semibold text-rose-300 drop-shadow-[0_0_10px_rgba(244,63,94,0.6)]">
+              <p className="text-xs font-semibold text-rose-300">
                 {codeError}
               </p>
             )}
             <button
               type="submit"
               disabled={verifyingCode}
-              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:from-pink-300 hover:via-amber-200 hover:to-lime-200 text-zinc-950 text-sm font-extrabold transition-all shadow-[0_0_36px_rgba(244,114,182,0.6),0_0_24px_rgba(74,222,128,0.45)] ring-1 ring-white/50 cursor-pointer"
+              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 hover:brightness-105 text-zinc-950 text-sm font-extrabold transition-all shadow-[0_0_32px_-4px_rgba(244,114,182,0.55)] cursor-pointer"
             >
               {verifyingCode ? 'Checking Code...' : 'Open Admin Panel'}
             </button>
@@ -1024,28 +1664,28 @@ export function AdminPanel({
   }
 
   return (
-    <div className="min-h-screen bg-[#030307] text-zinc-100 flex flex-col lg:flex-row relative overflow-x-hidden">
-      {/* Multi-Spectrum Ultra-Glow Pink, Light Green & Cyan Ambient Lights */}
+    <div className="min-h-screen bg-[#030307] dark-hd-studio text-zinc-100 flex flex-col lg:flex-row relative overflow-x-hidden">
+      {/* Ultra-Dark Multi-Glow Ambient Lights */}
       <div className="pointer-events-none fixed inset-0 z-0">
-        <div className="absolute -top-36 left-1/5 w-[600px] h-[360px] rounded-full blur-[150px] bg-pink-500/22" />
-        <div className="absolute -top-28 right-1/5 w-[600px] h-[360px] rounded-full blur-[150px] bg-lime-400/18" />
-        <div className="absolute top-[45%] -left-28 w-[460px] h-[460px] rounded-full blur-[160px] bg-cyan-400/15" />
-        <div className="absolute bottom-0 right-[-8%] w-[520px] h-[420px] rounded-full blur-[160px] bg-fuchsia-500/15" />
+        <div className="absolute -top-36 left-1/5 w-[600px] h-[360px] rounded-full blur-[150px] bg-pink-500/14" />
+        <div className="absolute -top-28 right-1/5 w-[560px] h-[340px] rounded-full blur-[150px] bg-lime-400/12" />
+        <div className="absolute top-[45%] -left-28 w-[440px] h-[440px] rounded-full blur-[160px] bg-cyan-400/10" />
+        <div className="absolute bottom-0 right-[-8%] w-[480px] h-[380px] rounded-full blur-[160px] bg-pink-500/10" />
       </div>
 
-      {/* Ultra-Glow Sidebar */}
-      <aside className="relative z-10 w-full lg:w-72 hd-glass-surface border-b lg:border-b-0 lg:border-r border-pink-400/35 shadow-[0_0_48px_-14px_rgba(244,114,182,0.4)] p-5 flex flex-col justify-between gap-6 shrink-0">
-        <span className="pointer-events-none hidden lg:block absolute inset-y-0 right-0 w-[1.5px] bg-gradient-to-b from-pink-400 via-cyan-300 to-lime-300 opacity-75" />
+      {/* Neon Dark Sidebar */}
+      <aside className="relative z-10 w-full lg:w-72 hd-glass-surface border-b lg:border-b-0 lg:border-r border-pink-300/30 shadow-[0_0_48px_-14px_rgba(244,114,182,0.28)] p-5 flex flex-col justify-between gap-6 shrink-0">
+        <span className="pointer-events-none hidden lg:block absolute inset-y-0 right-0 w-[1.5px] bg-gradient-to-b from-pink-400 via-amber-200 to-lime-300 opacity-65" />
         <div className="space-y-6">
-          <div className="p-3.5 rounded-2xl ultra-glow-topbar border border-pink-300/45 space-y-1 relative overflow-hidden">
+          <div className="p-3.5 rounded-2xl ultra-glow-topbar border border-pink-300/40 space-y-1 relative overflow-hidden">
             <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
             <div className="flex items-center gap-2">
-              <span className="font-display text-sm font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent truncate drop-shadow-[0_0_12px_rgba(255,255,255,0.4)]">
+              <span className="font-display text-sm font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent truncate">
                 {settings.brandName}
               </span>
               {settings.showCheckmark && <VerifiedMark theme={settings.glowTheme} size="sm" />}
             </div>
-            <p className="text-xs font-bold text-lime-300 drop-shadow-[0_0_10px_rgba(74,222,128,0.75)]">
+            <p className="text-xs font-bold text-lime-300">
               Admin Control Console
             </p>
           </div>
@@ -1070,13 +1710,13 @@ export function AdminPanel({
                   key={item.id}
                   type="button"
                   onClick={() => setActiveTab(item.id)}
-                  className={`flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl text-xs transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                  className={`flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-xs transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                     active
-                      ? 'bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 text-zinc-950 font-extrabold shadow-[0_0_28px_rgba(244,114,182,0.55),0_0_18px_rgba(74,222,128,0.4)] ring-1 ring-white/50'
-                      : 'text-zinc-200 font-semibold border border-white/10 bg-white/[0.03] hover:text-white hover:border-pink-300/45 hover:bg-pink-500/10 hover:shadow-[0_0_20px_-8px_rgba(244,114,182,0.55)]'
+                      ? 'bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 text-zinc-950 font-extrabold shadow-[0_0_24px_-4px_rgba(244,114,182,0.55)]'
+                      : 'text-zinc-300 font-semibold border border-white/10 bg-[#070911]/80 hover:text-white hover:border-pink-300/45 hover:bg-white/[0.06]'
                   }`}
                 >
-                  <Icon className={`w-4 h-4 shrink-0 ${active ? 'text-zinc-950' : 'text-cyan-300'}`} />
+                  <Icon className={`w-4 h-4 shrink-0 ${active ? 'text-zinc-950' : 'text-pink-300'}`} />
                   <span>{item.label}</span>
                 </button>
               );
@@ -1084,11 +1724,11 @@ export function AdminPanel({
           </nav>
         </div>
 
-        <div className="flex lg:flex-col gap-2.5 pt-4 border-t border-white/15">
+        <div className="flex lg:flex-col gap-2.5 pt-4 border-t border-white/10">
           <button
             type="button"
             onClick={onBackToStorefront}
-            className="inline-flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-lime-400/10 hover:bg-lime-400/20 border border-lime-300/45 text-xs font-bold text-lime-200 shadow-[0_0_22px_-8px_rgba(74,222,128,0.55)] transition-all cursor-pointer"
+            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-105 text-xs font-extrabold text-zinc-950 shadow-[0_0_20px_-6px_rgba(52,211,153,0.6)] transition-all cursor-pointer"
           >
             <ExternalLink className="w-3.5 h-3.5" /> View Storefront
           </button>
@@ -1110,7 +1750,7 @@ export function AdminPanel({
               }).catch(() => {});
               void onSignOut();
             }}
-            className="inline-flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-400/40 text-xs font-bold text-rose-200 shadow-[0_0_20px_-8px_rgba(244,63,94,0.45)] transition-all cursor-pointer"
+            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/50 text-xs font-bold text-rose-200 shadow-[0_0_18px_-8px_rgba(244,63,94,0.45)] transition-all cursor-pointer"
           >
             <LogOut className="w-3.5 h-3.5" /> Lock Admin
           </button>
@@ -1119,14 +1759,14 @@ export function AdminPanel({
 
       {/* Main Content */}
       <main className="relative z-10 flex-1 min-w-0 p-4 sm:p-8 space-y-6 overflow-y-auto">
-        {/* Top Header Bar with Ultra-Glow Highlights */}
-        <div className="relative flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-5 rounded-2xl hd-glass-surface border border-pink-300/40 shadow-[0_0_40px_-12px_rgba(244,114,182,0.45),0_0_32px_-12px_rgba(56,189,248,0.3)] overflow-hidden">
+        {/* Top Header Bar */}
+        <div className="relative flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-5 rounded-3xl hd-glass-surface border border-pink-300/40 shadow-[0_0_40px_-12px_rgba(244,114,182,0.35)] overflow-hidden">
           <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
           <div>
-            <p className="text-xs font-bold text-pink-300 drop-shadow-[0_0_8px_rgba(244,114,182,0.65)]">
+            <p className="text-xs font-bold text-pink-300">
               Admin Panel / {activeTab}
             </p>
-            <h1 className="font-display text-2xl sm:text-3xl font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent drop-shadow-[0_0_16px_rgba(255,255,255,0.28)] capitalize">
+            <h1 className="font-display text-2xl sm:text-3xl font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent capitalize">
               {activeTab === 'batches'
                 ? 'Batches & Thumbnail Studio'
                 : activeTab === 'offers'
@@ -1153,72 +1793,131 @@ export function AdminPanel({
           </div>
         </div>
 
-        {!isDbAdmin && (
-          <div className="relative p-4 rounded-2xl hd-glass-surface border border-amber-400/60 shadow-[0_0_36px_-8px_rgba(251,191,36,0.5)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 overflow-hidden">
-            <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-amber-300 via-pink-400 to-lime-300" />
-            <div className="flex items-start gap-2.5 text-xs font-medium text-amber-100">
-              <ShieldAlert className="w-4 h-4 text-amber-300 shrink-0 mt-0.5 drop-shadow-[0_0_8px_rgba(251,191,36,0.9)]" />
-              <span>
-                {checkingAdmin
-                  ? 'Verifying Firebase database sync...'
-                  : user
-                    ? `Signed in as ${user.email}, which is not authorized for database writes (${BOOTSTRAPPED_ADMIN_EMAIL}).`
-                    : `Connect your Firebase Admin account (${BOOTSTRAPPED_ADMIN_EMAIL}) once in this browser to load live payment approvals and save changes.`}
-              </span>
+        {/* Live Vercel Sync Connection Bar (https://khatushyamlearning.vercel.app/) */}
+        <div
+          className={`relative p-4 rounded-2xl hd-glass-surface border flex flex-col md:flex-row md:items-center justify-between gap-3 overflow-hidden ${
+            user && isDbAdmin
+              ? 'border-lime-400/50 shadow-[0_0_28px_-10px_rgba(74,222,128,0.38)]'
+              : 'border-amber-300/55 shadow-[0_0_28px_-10px_rgba(251,191,36,0.38)]'
+          }`}
+        >
+          <span
+            className={`pointer-events-none absolute inset-x-0 top-0 h-[2px] ${
+              user && isDbAdmin
+                ? 'bg-gradient-to-r from-emerald-400 via-white to-lime-300'
+                : 'bg-gradient-to-r from-amber-300 via-pink-300 to-cyan-300'
+            }`}
+          />
+          <div className="flex items-start gap-3 min-w-0">
+            <span
+              className={`mt-1 w-2.5 h-2.5 rounded-full shrink-0 ${
+                user && isDbAdmin
+                  ? 'bg-lime-400 shadow-[0_0_12px_rgba(163,230,53,0.9)] animate-pulse'
+                  : 'bg-amber-300 shadow-[0_0_10px_rgba(252,211,77,0.8)]'
+              }`}
+            />
+            <div className="min-w-0 space-y-0.5">
+              <p className="text-xs font-extrabold text-white flex flex-wrap items-center gap-2">
+                <span>
+                  {user && isDbAdmin
+                    ? 'Live Connected: khatushyamlearning.vercel.app'
+                    : 'Connect Vercel Live Sync (khatushyamlearning.vercel.app)'}
+                </span>
+                {user && isDbAdmin && (
+                  <span className="text-[11px] font-mono text-lime-300">
+                    ({user.email})
+                  </span>
+                )}
+              </p>
+              <p className="text-[11px] text-zinc-300 leading-relaxed">
+                {user && isDbAdmin
+                  ? 'Every Batch, Offer, Payment Setting & Order Approval here updates https://khatushyamlearning.vercel.app/ immediately.'
+                  : user && !isDbAdmin
+                    ? `Signed in as ${user.email}, which is not admin. Switch to ${BOOTSTRAPPED_ADMIN_EMAIL} so updates sync live to khatushyamlearning.vercel.app.`
+                    : `Sign in once with ${BOOTSTRAPPED_ADMIN_EMAIL} so every update here pushes live to https://khatushyamlearning.vercel.app/.`}
+              </p>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {user && (
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {user && isDbAdmin ? (
+              <>
                 <button
                   type="button"
-                  onClick={() => void onSignOut()}
-                  className="px-3 py-2 rounded-xl border border-white/25 bg-white/5 text-xs font-semibold text-zinc-100 hover:text-white"
+                  disabled={syncingFirestore}
+                  onClick={() => void handleSyncOldFirebaseBatches()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-300/45 text-xs font-bold text-cyan-200 cursor-pointer disabled:opacity-60"
                 >
-                  Switch
+                  <RefreshCw className={`w-3.5 h-3.5 ${syncingFirestore ? 'animate-spin' : ''}`} />
+                  {syncingFirestore ? 'Pulling...' : 'Pull from Vercel'}
                 </button>
-              )}
-              <button
-                type="button"
-                disabled={connectingDb}
-                onClick={() => void handleConnectDb()}
-                className={glowPrimaryBtnClass}
-              >
-                <LogIn className="w-3.5 h-3.5" />
-                {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {quotaExceeded && (
-          <div className="relative p-4 rounded-2xl hd-glass-surface border border-rose-400/60 shadow-[0_0_32px_-8px_rgba(244,63,94,0.5)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 overflow-hidden">
-            <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-rose-400 via-amber-300 to-pink-400" />
-            <div className="flex items-start gap-2.5 text-xs font-medium text-rose-100 leading-relaxed">
-              <ShieldAlert className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" />
-              <span>
-                <strong>Firestore Free Daily Read Quota Exceeded:</strong> Google Cloud Firestore has hit today&apos;s free read-unit limit (resets tomorrow; see Spark plan details under Enterprise edition at firebase.google.com/pricing#cloud-firestore). Cached batches remain visible on Storefront, or upgrade your Firebase database plan below.
-              </span>
-            </div>
+                <button
+                  type="button"
+                  disabled={pushingToVercel}
+                  onClick={() => void handlePushAllToVercel()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-400 to-lime-300 hover:brightness-105 text-zinc-950 text-xs font-extrabold shadow-[0_0_20px_-6px_rgba(74,222,128,0.65)] cursor-pointer disabled:opacity-60"
+                >
+                  <Globe className={`w-3.5 h-3.5 ${pushingToVercel ? 'animate-spin' : ''}`} />
+                  {pushingToVercel ? 'Pushing...' : 'Push All to Vercel'}
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  disabled={syncingFirestore}
+                  onClick={() => void handleSyncOldFirebaseBatches()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/20 text-xs font-bold text-zinc-200 cursor-pointer disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${syncingFirestore ? 'animate-spin' : ''}`} />
+                  {syncingFirestore ? 'Syncing...' : 'Pull Vercel Batches'}
+                </button>
+                <button
+                  type="button"
+                  disabled={connectingSync}
+                  onClick={() => void handleConnectVercelSync()}
+                  className={glowPrimaryBtnClass}
+                >
+                  <Globe className="w-3.5 h-3.5" />
+                  {connectingSync
+                    ? 'Connecting...'
+                    : user && !isDbAdmin
+                      ? 'Switch to Admin Gmail'
+                      : 'Connect Vercel Sync (Google)'}
+                </button>
+                <a
+                  href={typeof window !== 'undefined' ? window.location.href : '/ksl-admin-872'}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-cyan-300/45 bg-cyan-500/10 hover:bg-cyan-500/20 text-xs font-bold text-cyan-200"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Open Admin in Chrome Tab
+                </a>
+              </>
+            )}
             <a
-              href={FIRESTORE_UPGRADE_URL}
+              href="https://khatushyamlearning.vercel.app/"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-amber-300 to-pink-400 text-zinc-950 text-xs font-extrabold whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-pink-300/45 bg-pink-500/10 hover:bg-pink-500/20 text-xs font-bold text-pink-200"
             >
-              Upgrade Firestore Plan
+              <ExternalLink className="w-3.5 h-3.5" />
+              Open Vercel
             </a>
           </div>
-        )}
+        </div>
 
         {statusMessage && (
-          <div className="p-3.5 rounded-xl bg-lime-400/15 border border-lime-300/60 shadow-[0_0_28px_-6px_rgba(74,222,128,0.55)] text-xs font-semibold text-lime-200 flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0 drop-shadow-[0_0_8px_rgba(74,222,128,0.9)]" />
+          <div className="p-3.5 rounded-2xl bg-emerald-500/15 border border-lime-400/55 shadow-[0_0_24px_-6px_rgba(74,222,128,0.45)] text-xs font-semibold text-lime-200 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
             <span>{statusMessage}</span>
           </div>
         )}
-        {errorMessage && (
-          <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-400/60 shadow-[0_0_28px_-6px_rgba(244,63,94,0.55)] text-xs font-semibold text-rose-200 flex items-center gap-2">
-            <XCircle className="w-4 h-4 text-rose-300 shrink-0 drop-shadow-[0_0_8px_rgba(244,63,94,0.9)]" />
-            <span>{errorMessage}</span>
+        {(errorMessage || authError) && (
+          <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-400/60 shadow-[0_0_24px_-6px_rgba(244,63,94,0.45)] text-xs font-semibold text-rose-200 flex items-center gap-2">
+            <XCircle className="w-4 h-4 text-rose-300 shrink-0" />
+            <span>{errorMessage || authError}</span>
           </div>
         )}
 
@@ -1226,31 +1925,31 @@ export function AdminPanel({
         {activeTab === 'overview' && (
           <div className="space-y-8">
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className="relative p-5 rounded-2xl hd-glass-surface border border-lime-400/55 glow-card-emerald space-y-1 overflow-hidden">
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-lime-300 via-emerald-300 to-cyan-300" />
-                <p className="text-xs font-semibold text-lime-200">Approved Revenue</p>
-                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-lime-300 drop-shadow-[0_0_16px_rgba(74,222,128,0.65)]">
+              <div className="relative p-5 rounded-3xl hd-glass-surface border border-lime-400/50 glow-card-emerald space-y-1 overflow-hidden">
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-emerald-400 via-white to-lime-300" />
+                <p className="text-xs font-semibold text-emerald-200">Approved Revenue</p>
+                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-lime-300">
                   ₹{stats.revenue.toLocaleString('en-IN')}
                 </p>
               </div>
-              <div className="relative p-5 rounded-2xl hd-glass-surface border border-amber-400/55 glow-card-amber space-y-1 overflow-hidden">
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-amber-300 via-yellow-200 to-pink-400" />
+              <div className="relative p-5 rounded-3xl hd-glass-surface border border-amber-300/50 glow-card-amber space-y-1 overflow-hidden">
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-amber-300 via-white to-pink-300" />
                 <p className="text-xs font-semibold text-amber-200">Pending Approvals</p>
-                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-amber-300 drop-shadow-[0_0_16px_rgba(251,191,36,0.65)]">
+                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-amber-300">
                   {stats.pending}
                 </p>
               </div>
-              <div className="relative p-5 rounded-2xl hd-glass-surface border border-cyan-400/55 glow-card-sapphire space-y-1 overflow-hidden">
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-cyan-300 via-sky-300 to-pink-300" />
+              <div className="relative p-5 rounded-3xl hd-glass-surface border border-cyan-400/50 glow-card-sapphire space-y-1 overflow-hidden">
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-cyan-300 via-white to-sky-400" />
                 <p className="text-xs font-semibold text-cyan-200">Approved Students</p>
-                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-cyan-200 drop-shadow-[0_0_16px_rgba(56,189,248,0.65)]">
+                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-cyan-300">
                   {stats.approvedCount}
                 </p>
               </div>
-              <div className="relative p-5 rounded-2xl hd-glass-surface border border-pink-400/55 glow-card-crimson space-y-1 overflow-hidden">
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-fuchsia-300 to-lime-300" />
+              <div className="relative p-5 rounded-3xl hd-glass-surface border border-pink-400/50 glow-card-crimson space-y-1 overflow-hidden">
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-rose-400" />
                 <p className="text-xs font-semibold text-pink-200">Active Batches</p>
-                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-pink-200 drop-shadow-[0_0_16px_rgba(244,114,182,0.65)]">
+                <p className="text-2xl sm:text-3xl font-extrabold font-mono tabular-nums text-pink-300">
                   {stats.activeBatches}
                 </p>
               </div>
@@ -1259,19 +1958,19 @@ export function AdminPanel({
             <div className={`${glowCardClass} p-6 space-y-4`}>
               <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
               <div className="flex items-center justify-between gap-4">
-                <h2 className="text-base font-extrabold bg-gradient-to-r from-white via-pink-100 to-lime-100 bg-clip-text text-transparent">
+                <h2 className="text-base font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent">
                   Recent Pending Payment Requests
                 </h2>
                 <button
                   type="button"
                   onClick={() => setActiveTab('approvals')}
-                  className="px-3.5 py-1.5 rounded-xl bg-pink-500/15 border border-pink-400/45 text-xs font-bold text-pink-200 hover:bg-pink-500/25 shadow-[0_0_18px_-6px_rgba(244,114,182,0.5)] transition-all cursor-pointer"
+                  className="px-4 py-1.5 rounded-xl bg-pink-500/15 border border-pink-300/45 text-xs font-bold text-pink-200 hover:bg-pink-500/25 transition-all cursor-pointer"
                 >
                   Manage All
                 </button>
               </div>
               {allOrders.filter((o) => o.status === 'pending').length === 0 ? (
-                <p className="text-xs text-zinc-300">No pending payments right now.</p>
+                <p className="text-xs text-zinc-400">No pending payments right now.</p>
               ) : (
                 <div className="divide-y divide-white/10">
                   {allOrders
@@ -1288,7 +1987,7 @@ export function AdminPanel({
                             <span className="text-lime-300 font-mono">₹{ord.amount}</span>{' '}
                             {ord.planLabel ? `(${ord.batchTitle} · ${ord.planLabel})` : `(${ord.batchTitle})`}
                           </p>
-                          <p className="font-mono text-cyan-200/90">
+                          <p className="font-mono text-zinc-300">
                             UTR: {ord.utrNumber} · {ord.studentPhone}
                           </p>
                         </div>
@@ -1296,14 +1995,14 @@ export function AdminPanel({
                           <button
                             type="button"
                             onClick={() => void handleApproveOrder(ord)}
-                            className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-lime-300 to-emerald-400 hover:from-lime-200 hover:to-emerald-300 text-zinc-950 text-xs font-extrabold shadow-[0_0_20px_rgba(74,222,128,0.55)] cursor-pointer"
+                            className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-105 text-zinc-950 text-xs font-extrabold cursor-pointer"
                           >
                             Approve
                           </button>
                           <button
                             type="button"
                             onClick={() => void handleRejectOrder(ord)}
-                            className="px-3.5 py-1.5 rounded-xl border border-rose-400/50 text-rose-200 hover:bg-rose-500/20 text-xs font-bold shadow-[0_0_16px_-6px_rgba(244,63,94,0.45)] cursor-pointer"
+                            className="px-4 py-1.5 rounded-xl border border-rose-400/55 text-rose-200 hover:bg-rose-500/20 text-xs font-bold cursor-pointer"
                           >
                             Reject
                           </button>
@@ -1336,7 +2035,7 @@ export function AdminPanel({
                       setEditingId(null);
                       setBatchForm(EMPTY_BATCH_FORM);
                     }}
-                    className="px-3 py-1 rounded-lg border border-white/15 text-xs font-semibold text-zinc-300 hover:text-white"
+                    className="px-3 py-1 rounded-xl border border-white/15 text-xs font-semibold text-zinc-200 hover:text-white cursor-pointer"
                   >
                     Cancel Edit
                   </button>
@@ -1351,14 +2050,14 @@ export function AdminPanel({
                       <VerifiedMark theme={batchForm.glowAccent} size="sm" />
                     )}
                   </label>
-                  <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-lime-200 cursor-pointer">
+                  <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-lime-300 cursor-pointer">
                     <input
                       type="checkbox"
                       checked={batchForm.showCheckmark}
                       onChange={(e) =>
                         setBatchForm({ ...batchForm, showCheckmark: e.target.checked })
                       }
-                      className="accent-lime-400"
+                      className="accent-pink-400"
                     />
                     Checkmark beside Batch Name
                   </label>
@@ -1376,7 +2075,7 @@ export function AdminPanel({
 
               {/* Price, No-Payment Flow Toggle & Display Order */}
               <div className="space-y-3">
-                <label className="inline-flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-lime-400/10 border border-lime-400/40 text-xs font-bold text-lime-200 shadow-[0_0_20px_-8px_rgba(74,222,128,0.5)] cursor-pointer">
+                <label className="inline-flex items-center gap-2.5 px-4 py-2 rounded-xl bg-emerald-500/15 border border-lime-400/50 text-xs font-bold text-lime-200 shadow-[0_0_20px_-8px_rgba(74,222,128,0.4)] cursor-pointer">
                   <input
                     type="checkbox"
                     checked={!batchForm.requirePayment || Number(batchForm.price) === 0}
@@ -1389,14 +2088,14 @@ export function AdminPanel({
                         openType: noPay ? 'webview' : batchForm.openType,
                       });
                     }}
-                    className="accent-lime-400"
+                    className="accent-emerald-400"
                   />
                   No Payment Flow (Sabse Uper · Free / Direct Open inside app)
                 </label>
 
                 <div className="grid grid-cols-3 gap-4">
                   <div>
-                    <label className="block text-xs font-semibold text-lime-200 mb-1">
+                    <label className="block text-xs font-semibold text-lime-300 mb-1">
                       Sale Price (₹)
                     </label>
                     <input
@@ -1423,7 +2122,7 @@ export function AdminPanel({
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-zinc-200 mb-1">Original MRP (₹)</label>
+                    <label className="block text-xs font-semibold text-zinc-300 mb-1">Original MRP (₹)</label>
                     <input
                       type="number"
                       min={0}
@@ -1433,7 +2132,7 @@ export function AdminPanel({
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-cyan-200 mb-1">Sort Order</label>
+                    <label className="block text-xs font-semibold text-pink-200 mb-1">Sort Order</label>
                     <input
                       type="number"
                       min={0}
@@ -1445,7 +2144,7 @@ export function AdminPanel({
                 </div>
 
                 {batchForm.requirePayment && (
-                  <div className="p-3.5 rounded-2xl bg-[#060810]/90 border border-pink-400/35 space-y-3">
+                  <div className="p-3.5 rounded-2xl bg-[#070911] border border-pink-300/30 space-y-3">
                     <p className="text-xs font-extrabold text-pink-200">
                       3-Plan Popup Pricing (Plan 1 Popular uses Sale Price ₹{batchForm.price || 0})
                     </p>
@@ -1493,7 +2192,7 @@ export function AdminPanel({
                         </div>
                       </div>
                       <div className="space-y-1.5">
-                        <label className="block text-[11px] font-semibold text-lime-200">
+                        <label className="block text-[11px] font-semibold text-lime-300">
                           Plan 3 Label &amp; Price (₹)
                         </label>
                         <div className="flex gap-2">
@@ -1525,13 +2224,13 @@ export function AdminPanel({
               </div>
 
               {/* Thumbnail Size, Aspect & Glow Controls */}
-              <div className="p-4 rounded-2xl bg-[#060810]/90 border border-cyan-400/35 shadow-[0_0_32px_-12px_rgba(56,189,248,0.4)] space-y-4">
+              <div className="p-4 rounded-2xl bg-[#070911] border border-white/15 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-xs font-extrabold text-cyan-300 drop-shadow-[0_0_8px_rgba(56,189,248,0.75)]">
+                  <p className="text-xs font-extrabold text-pink-200">
                     Thumbnail Size, Upload &amp; HD Generator
                   </p>
                   <div className="flex flex-wrap items-center gap-2">
-                    <label className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/15 border border-pink-300/40 text-xs font-bold text-white shadow-[0_0_16px_-6px_rgba(244,114,182,0.45)] cursor-pointer">
+                    <label className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/20 text-xs font-bold text-white cursor-pointer">
                       <ImagePlus className="w-3.5 h-3.5 text-pink-300" />
                       Upload Thumbnail
                       <input
@@ -1545,7 +2244,7 @@ export function AdminPanel({
                       type="button"
                       disabled={generatingThumb}
                       onClick={() => void handleGenerateThumbnail()}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:from-pink-300 hover:to-lime-200 text-zinc-950 text-xs font-extrabold shadow-[0_0_24px_rgba(244,114,182,0.5)] disabled:opacity-60 cursor-pointer"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 hover:brightness-105 text-zinc-950 text-xs font-extrabold shadow-[0_0_20px_rgba(244,114,182,0.4)] disabled:opacity-60 cursor-pointer"
                     >
                       <Wand2 className="w-3.5 h-3.5" />
                       {generatingThumb ? 'Generating...' : 'Generate Thumbnail'}
@@ -1602,10 +2301,10 @@ export function AdminPanel({
                       }
                       className={glowCompactInputClass}
                     >
-                      <option value="amber">Amber Gold</option>
-                      <option value="crimson">Pink / Crimson</option>
-                      <option value="sapphire">Cyan / Sapphire</option>
-                      <option value="emerald">Light Green Glow</option>
+                      <option value="amber">Neon Gold</option>
+                      <option value="crimson">Neon Pink</option>
+                      <option value="sapphire">Cyan Glow</option>
+                      <option value="emerald">Lime Emerald</option>
                     </select>
                   </div>
                   <div>
@@ -1638,15 +2337,15 @@ export function AdminPanel({
                       alt={batchForm.title || 'Preview'}
                       aspect={batchForm.thumbnailAspect}
                       glow={batchForm.glowAccent}
-                      className="rounded-xl border border-pink-300/35 shadow-[0_0_28px_-8px_rgba(244,114,182,0.5)]"
+                      className="rounded-xl border border-white/20 shadow-[0_0_24px_-8px_rgba(244,114,182,0.4)]"
                     />
                   </div>
                 )}
               </div>
 
               {/* Open Type & Protected Target Link */}
-              <div className="p-4 rounded-2xl bg-[#060810]/90 border border-lime-400/35 shadow-[0_0_32px_-12px_rgba(74,222,128,0.4)] space-y-4">
-                <p className="text-xs font-extrabold text-lime-300 drop-shadow-[0_0_8px_rgba(74,222,128,0.75)]">
+              <div className="p-4 rounded-2xl bg-[#070911] border border-lime-400/35 space-y-4">
+                <p className="text-xs font-extrabold text-lime-300">
                   {!batchForm.requirePayment || Number(batchForm.price) === 0
                     ? 'Direct Open Link Configuration (No Payment Flow · Top Priority)'
                     : 'Unlocked Link Configuration (Hidden until Admin Approval; WebView links stay hidden)'}
@@ -1670,18 +2369,19 @@ export function AdminPanel({
                   <div>
                     <label className="block text-xs font-semibold text-zinc-200 mb-1">Target URL</label>
                     <input
-                      type="url"
+                      type="text"
+                      inputMode="url"
                       required
                       maxLength={1000}
                       value={batchForm.targetUrl}
                       onChange={(e) => setBatchForm({ ...batchForm, targetUrl: e.target.value })}
-                      placeholder="https://..."
+                      placeholder="https://... or t.me/..."
                       className={`${glowCompactInputClass} font-mono`}
                     />
                   </div>
                 </div>
                 {batchForm.openType === 'webview' && (
-                  <p className="text-[11px] font-medium text-cyan-200/90">
+                  <p className="text-[11px] font-medium text-pink-200/85">
                     Students run this WebView inside the app — the URL and external tab button stay completely hidden.
                   </p>
                 )}
@@ -1702,33 +2402,44 @@ export function AdminPanel({
                 </div>
               </div>
 
-              {!isDbAdmin && (
-                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-100">
-                  <span>
-                    Batch save karne ke liye ek baar <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> se Database Sync connect karein.
-                  </span>
-                  <button
-                    type="button"
-                    disabled={connectingDb}
-                    onClick={() => void handleConnectDb()}
-                    className={glowPrimaryBtnClass}
-                  >
-                    <LogIn className="w-3.5 h-3.5" />
-                    {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
-                  </button>
-                </div>
-              )}
-
-              {errorMessage && (
+              {(errorMessage || authError) && (
                 <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-400/60 text-xs font-semibold text-rose-200 flex items-center gap-2">
                   <XCircle className="w-4 h-4 text-rose-300 shrink-0" />
-                  <span>{errorMessage}</span>
+                  <span>{errorMessage || authError}</span>
                 </div>
               )}
               {statusMessage && (
-                <div className="p-3 rounded-xl bg-lime-400/15 border border-lime-300/60 text-xs font-semibold text-lime-200 flex items-center gap-2">
+                <div className="p-3 rounded-xl bg-emerald-500/15 border border-lime-400/55 text-xs font-semibold text-lime-200 flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
                   <span>{statusMessage}</span>
+                </div>
+              )}
+
+              {(!user || !isDbAdmin) && (
+                <div className="p-3.5 rounded-2xl bg-amber-400/12 border border-amber-300/45 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <p className="text-[11px] text-amber-100 leading-relaxed">
+                    Connect <span className="font-mono font-bold">{BOOTSTRAPPED_ADMIN_EMAIL}</span> once so updates push live to <span className="font-semibold">khatushyamlearning.vercel.app</span>. (If popup is blocked in Custom Tab or preview frame, tap <span className="font-bold">Open in Full Tab</span> or <span className="font-bold">⋮ → Open in Chrome</span>.)
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <a
+                      href={typeof window !== 'undefined' ? window.location.href : '/ksl-admin-872'}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl border border-cyan-300/45 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 text-xs font-bold"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      Open in Full Tab
+                    </a>
+                    <button
+                      type="button"
+                      disabled={connectingSync}
+                      onClick={() => void handleConnectVercelSync()}
+                      className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-amber-300 to-lime-300 text-zinc-950 text-xs font-extrabold cursor-pointer disabled:opacity-60"
+                    >
+                      <Globe className="w-3.5 h-3.5" />
+                      {connectingSync ? 'Connecting...' : 'Connect Google Sync'}
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -1739,7 +2450,7 @@ export function AdminPanel({
                       type="checkbox"
                       checked={batchForm.isActive}
                       onChange={(e) => setBatchForm({ ...batchForm, isActive: e.target.checked })}
-                      className="accent-lime-400"
+                      className="accent-emerald-400"
                     />
                     Visible on Storefront
                   </label>
@@ -1767,11 +2478,41 @@ export function AdminPanel({
 
             {/* Existing Batches List */}
             <div className="xl:col-span-5 space-y-3">
-              <h2 className="text-base font-extrabold bg-gradient-to-r from-white via-pink-100 to-lime-100 bg-clip-text text-transparent">
+              {!firestoreSynced && (
+                <div className="p-4 rounded-2xl hd-glass-surface border border-amber-300/50 shadow-[0_0_28px_-10px_rgba(251,191,36,0.35)] space-y-2.5">
+                  <p className="text-xs font-extrabold text-amber-200">
+                    Old Firebase Batches Pending Auto-Sync
+                  </p>
+                  <p className="text-[11px] text-zinc-300 leading-relaxed">
+                    Your older batches saved in Firebase Firestore are waiting because Google&apos;s free daily read quota is temporarily exhausted (resets tomorrow; see Spark plan under Enterprise edition at firebase.google.com/pricing#cloud-firestore). They will merge automatically once quota resets, or tap below:
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      disabled={syncingFirestore}
+                      onClick={() => void handleSyncOldFirebaseBatches()}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 text-zinc-950 text-xs font-extrabold cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${syncingFirestore ? 'animate-spin' : ''}`} />
+                      {syncingFirestore ? 'Checking Firebase...' : 'Sync Old Firebase Batches'}
+                    </button>
+                    <a
+                      href={FIRESTORE_UPGRADE_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 px-3 py-2 rounded-xl border border-amber-300/45 text-[11px] font-bold text-amber-200 hover:bg-amber-400/15"
+                    >
+                      Firebase Database Upgrade
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              <h2 className="text-base font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent">
                 Published Batches ({batches.length})
               </h2>
               {batches.length === 0 ? (
-                <div className="p-6 rounded-2xl hd-glass-surface border border-pink-300/30 text-xs text-zinc-300">
+                <div className="p-6 rounded-3xl hd-glass-surface border border-white/15 text-xs text-zinc-300">
                   No batches added yet. Fill out the form on the left and tap Publish Batch.
                 </div>
               ) : (
@@ -1785,7 +2526,7 @@ export function AdminPanel({
                   .map((b) => (
                   <div
                     key={b.id}
-                    className="p-4 rounded-2xl hd-glass-surface border border-pink-300/35 hover:border-lime-300/65 shadow-[0_0_30px_-12px_rgba(244,114,182,0.4)] flex items-center justify-between gap-4 transition-all"
+                    className="p-4 rounded-2xl hd-glass-surface border border-white/15 hover:border-pink-300/60 shadow-[0_0_28px_-12px_rgba(244,114,182,0.28)] flex items-center justify-between gap-4 transition-all"
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       {b.thumbnailUrl ? (
@@ -1795,7 +2536,7 @@ export function AdminPanel({
                           className="w-16 h-11 rounded-lg object-cover border border-white/20 shrink-0 bg-black"
                         />
                       ) : (
-                        <div className="w-16 h-11 rounded-lg border border-pink-300/30 shrink-0 bg-gradient-to-br from-[#1C1229] to-[#081C15] flex items-center justify-center">
+                        <div className="w-16 h-11 rounded-lg border border-white/15 shrink-0 bg-gradient-to-br from-[#1C1229] to-[#081C15] flex items-center justify-center">
                           <Layers className="w-4 h-4 text-pink-300" />
                         </div>
                       )}
@@ -1806,19 +2547,24 @@ export function AdminPanel({
                             <VerifiedMark theme={b.glowAccent} size="sm" className="shrink-0" />
                           )}
                         </div>
-                        <p className="text-[11px] text-lime-200/90 font-mono flex items-center gap-1.5 flex-wrap">
+                        <p className="text-[11px] text-zinc-300 font-mono flex items-center gap-1.5 flex-wrap">
                           <span
                             className={
                               b.requirePayment === false || b.price === 0
-                                ? 'px-1.5 py-0.5 rounded bg-lime-400/20 border border-lime-400/50 text-lime-300 font-bold'
-                                : ''
+                                ? 'px-2 py-0.5 rounded-lg bg-emerald-500/20 border border-lime-400/50 text-lime-300 font-bold'
+                                : 'text-lime-300 font-bold'
                             }
                           >
                             {b.requirePayment === false || b.price === 0 ? 'NO PAYMENT · FREE' : `₹${b.price}`}
                           </span>
-                          <span>
+                          <span className="text-zinc-400">
                             · {b.thumbnailSize} ({b.thumbnailAspect}) · {b.openType}
                           </span>
+                          {!secretTargets[b.id]?.targetUrl && (
+                            <span className="px-1.5 py-0.5 rounded bg-amber-400/20 border border-amber-400/50 text-amber-200 font-bold">
+                              Tap Edit to set URL
+                            </span>
+                          )}
                         </p>
                       </div>
                     </div>
@@ -1826,7 +2572,7 @@ export function AdminPanel({
                       <button
                         type="button"
                         onClick={() => void handleEditBatch(b)}
-                        className="p-2 rounded-xl border border-cyan-300/35 bg-cyan-400/10 text-cyan-200 hover:text-white hover:bg-cyan-400/20 cursor-pointer"
+                        className="p-2 rounded-xl border border-pink-300/40 bg-pink-500/10 text-pink-200 hover:text-white hover:bg-pink-500/25 cursor-pointer"
                         title="Edit Batch"
                       >
                         <Edit3 className="w-3.5 h-3.5" />
@@ -1834,7 +2580,7 @@ export function AdminPanel({
                       <button
                         type="button"
                         onClick={() => void handleDeleteBatch(b.id)}
-                        className="p-2 rounded-xl border border-rose-400/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
+                        className="p-2 rounded-xl border border-rose-400/45 bg-rose-500/10 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
                         title="Delete Batch"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -1856,11 +2602,11 @@ export function AdminPanel({
                 onSubmit={handleSaveOffer}
                 className={`p-6 space-y-4 ${glowCardClass}`}
               >
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-amber-300 via-pink-400 to-lime-300" />
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
                 <div className="flex items-center justify-between">
                   <h2 className="text-base font-extrabold text-white flex items-center gap-2">
-                    <Flame className="w-4 h-4 text-amber-400 drop-shadow-[0_0_10px_rgba(251,191,36,0.9)]" />
-                    <span className="bg-gradient-to-r from-amber-200 via-pink-200 to-lime-200 bg-clip-text text-transparent">
+                    <Flame className="w-4 h-4 text-amber-300" />
+                    <span className="bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent">
                       {editingOfferId ? 'Edit Limited Offer' : 'Add New Limited Offer'}
                     </span>
                   </h2>
@@ -1877,7 +2623,7 @@ export function AdminPanel({
                           displayOrder: '1',
                         });
                       }}
-                      className="text-xs text-zinc-300 hover:text-white"
+                      className="text-xs text-zinc-300 hover:text-white cursor-pointer"
                     >
                       Cancel Edit
                     </button>
@@ -1924,21 +2670,6 @@ export function AdminPanel({
                   />
                 </div>
 
-                {!isDbAdmin && (
-                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-100">
-                    <span>Connect <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> to save offers.</span>
-                    <button
-                      type="button"
-                      disabled={connectingDb}
-                      onClick={() => void handleConnectDb()}
-                      className={glowPrimaryBtnClass}
-                    >
-                      <LogIn className="w-3.5 h-3.5" />
-                      {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
-                    </button>
-                  </div>
-                )}
-
                 <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
                   <div className="flex items-center gap-5 text-xs font-semibold text-zinc-200">
                     <label className="inline-flex items-center gap-2 cursor-pointer">
@@ -1946,7 +2677,7 @@ export function AdminPanel({
                         type="checkbox"
                         checked={offerForm.isActive}
                         onChange={(e) => setOfferForm({ ...offerForm, isActive: e.target.checked })}
-                        className="accent-lime-400"
+                        className="accent-pink-400"
                       />
                       Show on Storefront
                     </label>
@@ -1959,7 +2690,7 @@ export function AdminPanel({
                         onChange={(e) =>
                           setOfferForm({ ...offerForm, displayOrder: e.target.value })
                         }
-                        className="w-16 px-2.5 py-1 rounded-lg bg-[#070911] border border-pink-300/35 text-xs font-mono text-white"
+                        className="w-16 px-2.5 py-1 rounded-lg bg-[#070911] border border-white/15 text-xs font-mono text-white"
                       />
                     </div>
                   </div>
@@ -1979,8 +2710,8 @@ export function AdminPanel({
                 onSubmit={handleSaveSettings}
                 className={`p-6 space-y-4 ${glowCardClass}`}
               >
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-cyan-300 via-pink-400 to-lime-300" />
-                <h3 className="text-sm font-extrabold text-cyan-200 drop-shadow-[0_0_8px_rgba(56,189,248,0.65)]">
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-cyan-400 via-white to-lime-300" />
+                <h3 className="text-sm font-extrabold text-cyan-200">
                   Telegram Channel &amp; Limited Offer Badge Settings
                 </h3>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -2023,7 +2754,7 @@ export function AdminPanel({
                       onChange={(e) =>
                         setSettingsForm({ ...settingsForm, popupEnabled: e.target.checked })
                       }
-                      className="accent-lime-400"
+                      className="accent-pink-400"
                     />
                     Show Limited Offer Badge
                   </label>
@@ -2040,24 +2771,24 @@ export function AdminPanel({
 
             {/* Active Offers List */}
             <div className="xl:col-span-5 space-y-3">
-              <h2 className="text-base font-extrabold bg-gradient-to-r from-white via-pink-100 to-lime-100 bg-clip-text text-transparent">
+              <h2 className="text-base font-extrabold bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent">
                 Published Offers ({offers.length})
               </h2>
               {offers.length === 0 ? (
-                <div className="p-6 rounded-2xl hd-glass-surface border border-pink-300/30 text-xs text-zinc-300">
+                <div className="p-6 rounded-3xl hd-glass-surface border border-white/15 text-xs text-zinc-300">
                   No offers added yet. Add one on the left and it will show right below Limited Offer on the Storefront.
                 </div>
               ) : (
                 offers.map((offer) => (
                   <div
                     key={offer.id}
-                    className="p-4 rounded-2xl hd-glass-surface border border-amber-400/40 shadow-[0_0_28px_-10px_rgba(251,191,36,0.4)] flex items-center justify-between gap-4"
+                    className="p-4 rounded-2xl hd-glass-surface border border-white/15 shadow-[0_0_24px_-10px_rgba(244,114,182,0.3)] flex items-center justify-between gap-4"
                   >
                     <div className="min-w-0 space-y-0.5">
                       <div className="flex items-center gap-2">
                         <p className="text-xs font-bold text-white truncate">{offer.title}</p>
                         {offer.badge && (
-                          <span className="px-2 py-0.5 rounded-md bg-gradient-to-r from-amber-300 to-pink-400 text-zinc-950 text-[10px] font-extrabold shrink-0">
+                          <span className="px-2 py-0.5 rounded-lg bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 text-zinc-950 text-[10px] font-extrabold shrink-0">
                             {offer.badge}
                           </span>
                         )}
@@ -2065,7 +2796,7 @@ export function AdminPanel({
                       {offer.description && (
                         <p className="text-[11px] text-zinc-300 truncate">{offer.description}</p>
                       )}
-                      <p className="text-[10px] font-mono text-lime-200/80">
+                      <p className="text-[10px] font-mono text-lime-300">
                         {offer.isActive ? 'Visible on Storefront' : 'Hidden'} · Order #{offer.displayOrder}
                       </p>
                     </div>
@@ -2082,7 +2813,7 @@ export function AdminPanel({
                             displayOrder: String(offer.displayOrder),
                           });
                         }}
-                        className="p-2 rounded-xl border border-cyan-300/35 bg-cyan-400/10 text-cyan-200 hover:text-white cursor-pointer"
+                        className="p-2 rounded-xl border border-pink-300/40 bg-pink-500/10 text-pink-200 hover:text-white cursor-pointer"
                         title="Edit Offer"
                       >
                         <Edit3 className="w-3.5 h-3.5" />
@@ -2090,7 +2821,7 @@ export function AdminPanel({
                       <button
                         type="button"
                         onClick={() => void handleDeleteOffer(offer.id)}
-                        className="p-2 rounded-xl border border-rose-400/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
+                        className="p-2 rounded-xl border border-rose-400/45 bg-rose-500/10 text-rose-300 hover:bg-rose-500/25 cursor-pointer"
                         title="Delete Offer"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -2107,15 +2838,15 @@ export function AdminPanel({
         {activeTab === 'approvals' && (
           <div className="space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex items-center gap-1.5 p-1.5 hd-glass-surface border border-pink-300/35 rounded-xl shadow-[0_0_24px_-8px_rgba(244,114,182,0.4)]">
+              <div className="flex items-center gap-1.5 p-1.5 hd-glass-surface border border-white/15 rounded-2xl shadow-[0_0_24px_-8px_rgba(244,114,182,0.25)]">
                 {(['pending', 'approved', 'rejected', 'all'] as const).map((tab) => (
                   <button
                     key={tab}
                     type="button"
                     onClick={() => setOrderFilter(tab)}
-                    className={`px-3.5 py-1.5 rounded-lg text-xs font-bold capitalize transition-all cursor-pointer ${
+                    className={`px-4 py-1.5 rounded-xl text-xs font-bold capitalize transition-all cursor-pointer ${
                       orderFilter === tab
-                        ? 'bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 text-zinc-950 font-extrabold shadow-[0_0_18px_rgba(244,114,182,0.5)]'
+                        ? 'bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 text-zinc-950 font-extrabold'
                         : 'text-zinc-300 hover:text-white'
                     }`}
                   >
@@ -2128,12 +2859,12 @@ export function AdminPanel({
                 value={orderSearch}
                 onChange={(e) => setOrderSearch(e.target.value)}
                 placeholder="Search student, phone, UTR..."
-                className="px-3.5 py-2.5 rounded-xl bg-[#070911]/95 border border-pink-300/40 text-xs text-white placeholder:text-zinc-400 w-full sm:w-64 focus:outline-none focus:border-lime-300 focus:shadow-[0_0_20px_-6px_rgba(74,222,128,0.55)]"
+                className="px-4 py-2.5 rounded-xl bg-[#070911] border border-pink-300/35 text-xs text-white placeholder:text-zinc-500 w-full sm:w-64 focus:outline-none focus:border-lime-300"
               />
             </div>
 
             {filteredOrders.length === 0 ? (
-              <div className="p-8 rounded-2xl hd-glass-surface border border-pink-300/30 text-center text-xs text-zinc-300">
+              <div className="p-8 rounded-3xl hd-glass-surface border border-white/15 text-center text-xs text-zinc-300">
                 No orders matching this filter.
               </div>
             ) : (
@@ -2143,17 +2874,17 @@ export function AdminPanel({
                     key={ord.id}
                     className={`p-5 ${glowCardClass} space-y-4`}
                   >
-                    <span className="pointer-events-none absolute inset-x-0 top-0 h-[1.5px] bg-gradient-to-r from-pink-400 via-cyan-300 to-lime-300" />
+                    <span className="pointer-events-none absolute inset-x-0 top-0 h-[1.5px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
                     <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                       <div className="space-y-1">
                         <div className="flex flex-wrap items-center gap-2 text-xs">
                           <span
                             className={`font-extrabold ${
                               ord.status === 'approved'
-                                ? 'text-lime-300 drop-shadow-[0_0_8px_rgba(74,222,128,0.8)]'
+                                ? 'text-lime-300'
                                 : ord.status === 'rejected'
                                   ? 'text-rose-400'
-                                  : 'text-amber-300 drop-shadow-[0_0_8px_rgba(251,191,36,0.8)]'
+                                  : 'text-amber-300'
                             }`}
                           >
                             {ord.status.toUpperCase()}
@@ -2163,7 +2894,7 @@ export function AdminPanel({
                             ₹{ord.amount.toLocaleString('en-IN')}
                           </span>
                           <span className="text-zinc-500">·</span>
-                          <span className="text-cyan-200">{ord.paymentMethod}</span>
+                          <span className="text-cyan-300">{ord.paymentMethod}</span>
                         </div>
                         <h3 className="text-sm font-extrabold text-white">
                           {ord.studentName} — {ord.batchTitle}
@@ -2182,7 +2913,7 @@ export function AdminPanel({
                           <button
                             type="button"
                             onClick={() => setPreviewScreenshot(ord.screenshotUrl)}
-                            className="px-3.5 py-2 rounded-xl bg-cyan-400/15 hover:bg-cyan-400/25 border border-cyan-300/45 text-xs font-bold text-cyan-200 cursor-pointer"
+                            className="px-3.5 py-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-300/45 text-xs font-bold text-cyan-200 cursor-pointer"
                           >
                             View Receipt
                           </button>
@@ -2197,19 +2928,19 @@ export function AdminPanel({
                               [ord.id]: e.target.value,
                             }))
                           }
-                          className="px-3 py-2 rounded-xl bg-[#070911] border border-pink-300/35 text-xs text-white placeholder:text-zinc-400 w-44 focus:outline-none focus:border-lime-300"
+                          className="px-3 py-2 rounded-xl bg-[#070911] border border-white/15 text-xs text-white placeholder:text-zinc-500 w-44 focus:outline-none focus:border-pink-300"
                         />
                         <button
                           type="button"
                           onClick={() => void handleApproveOrder(ord)}
-                          className="px-4 py-2 rounded-xl bg-gradient-to-r from-lime-300 to-emerald-400 hover:from-lime-200 hover:to-emerald-300 text-zinc-950 text-xs font-extrabold shadow-[0_0_24px_rgba(74,222,128,0.6)] cursor-pointer"
+                          className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-105 text-zinc-950 text-xs font-extrabold cursor-pointer"
                         >
                           Approve &amp; Open
                         </button>
                         <button
                           type="button"
                           onClick={() => void handleRejectOrder(ord)}
-                          className="px-4 py-2 rounded-xl border border-rose-400/50 text-rose-200 hover:bg-rose-500/20 text-xs font-bold shadow-[0_0_16px_-6px_rgba(244,63,94,0.45)] cursor-pointer"
+                          className="px-4 py-2 rounded-xl border border-rose-400/55 text-rose-200 hover:bg-rose-500/20 text-xs font-bold cursor-pointer"
                         >
                           Reject
                         </button>
@@ -2247,7 +2978,7 @@ export function AdminPanel({
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-lime-200 mb-1">Merchant Display Name</label>
+                  <label className="block text-xs font-semibold text-lime-300 mb-1">Merchant Display Name</label>
                   <input
                     type="text"
                     maxLength={100}
@@ -2261,7 +2992,7 @@ export function AdminPanel({
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-cyan-200 mb-2">
+                <label className="block text-xs font-semibold text-pink-200 mb-2">
                   Toggle Supported Payment Options
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -2274,8 +3005,8 @@ export function AdminPanel({
                         onClick={() => togglePaymentMethod(m.id)}
                         className={`flex items-center justify-between px-3.5 py-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                           enabled
-                            ? 'bg-gradient-to-r from-pink-500/20 to-lime-400/15 border-lime-300/65 text-white shadow-[0_0_22px_-8px_rgba(74,222,128,0.55)]'
-                            : 'bg-[#070911] border-white/15 text-zinc-300 hover:border-pink-300/35'
+                            ? 'bg-gradient-to-r from-pink-500/18 to-lime-400/15 border-pink-300/65 text-white'
+                            : 'bg-[#070911] border-white/15 text-zinc-300 hover:border-white/35'
                         }`}
                       >
                         <span className="text-xs font-semibold">{m.label}</span>
@@ -2330,21 +3061,6 @@ export function AdminPanel({
                 />
               </div>
 
-              {!isDbAdmin && (
-                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-100">
-                  <span>Connect <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> to save payment settings.</span>
-                  <button
-                    type="button"
-                    disabled={connectingDb}
-                    onClick={() => void handleConnectDb()}
-                    className={glowPrimaryBtnClass}
-                  >
-                    <LogIn className="w-3.5 h-3.5" />
-                    {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
-                  </button>
-                </div>
-              )}
-
               {errorMessage && (
                 <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-400/60 text-xs font-semibold text-rose-200 flex items-center gap-2">
                   <XCircle className="w-4 h-4 text-rose-300 shrink-0" />
@@ -2352,7 +3068,7 @@ export function AdminPanel({
                 </div>
               )}
               {statusMessage && (
-                <div className="p-3 rounded-xl bg-lime-400/15 border border-lime-300/60 text-xs font-semibold text-lime-200 flex items-center gap-2">
+                <div className="p-3 rounded-xl bg-emerald-500/15 border border-lime-400/55 text-xs font-semibold text-lime-200 flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
                   <span>{statusMessage}</span>
                 </div>
@@ -2368,13 +3084,13 @@ export function AdminPanel({
             </div>
 
             {/* QR Preview & Upload */}
-            <div className="lg:col-span-5 relative p-6 rounded-2xl hd-glass-surface border border-lime-300/50 glow-card-emerald space-y-5 text-center overflow-hidden">
-              <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-lime-300 via-white to-cyan-300" />
-              <div className="flex items-center justify-center gap-2 text-sm font-extrabold text-lime-200">
-                <QrCode className="w-4 h-4 text-lime-300" />
+            <div className="lg:col-span-5 relative p-6 rounded-3xl hd-glass-surface border border-cyan-300/45 glow-card-sapphire space-y-5 text-center overflow-hidden">
+              <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-cyan-300 via-white to-lime-300" />
+              <div className="flex items-center justify-center gap-2 text-sm font-extrabold text-cyan-200">
+                <QrCode className="w-4 h-4 text-cyan-300" />
                 Checkout QR Code Preview
               </div>
-              <div className="inline-block p-4 rounded-2xl bg-white shadow-[0_0_40px_rgba(255,255,255,0.28)]">
+              <div className="inline-block p-4 rounded-2xl bg-white border-2 border-cyan-300/55 shadow-[0_0_32px_rgba(56,189,248,0.28)]">
                 {settingsForm.qrImageUrl ? (
                   <img
                     src={settingsForm.qrImageUrl}
@@ -2391,7 +3107,7 @@ export function AdminPanel({
                 )}
               </div>
               <div className="flex flex-wrap justify-center gap-2">
-                <label className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-pink-300/45 text-xs font-bold text-white cursor-pointer">
+                <label className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/20 text-xs font-bold text-white cursor-pointer">
                   <ImagePlus className="w-3.5 h-3.5 text-pink-300" />
                   Upload Custom QR Image
                   <input type="file" accept="image/*" onChange={handleQrUpload} className="hidden" />
@@ -2417,7 +3133,7 @@ export function AdminPanel({
             className={`max-w-3xl p-6 space-y-5 ${glowCardClass}`}
           >
             <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
-            <div className="p-4 rounded-2xl bg-gradient-to-r from-pink-500/15 via-[#090D16] to-lime-400/15 border border-lime-300/50 shadow-[0_0_30px_-10px_rgba(74,222,128,0.45)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="p-4 rounded-2xl bg-gradient-to-r from-pink-500/12 via-[#070911] to-lime-400/12 border border-pink-300/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <p className="text-xs font-extrabold text-lime-300">
                   Personal Admin Panel Link
@@ -2438,22 +3154,15 @@ export function AdminPanel({
               </button>
             </div>
 
-            <div className="p-4 rounded-2xl bg-gradient-to-r from-cyan-500/15 via-[#090D16] to-pink-500/15 border border-cyan-300/45 shadow-[0_0_28px_-10px_rgba(56,189,248,0.45)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="p-4 rounded-2xl bg-gradient-to-r from-cyan-500/15 via-[#070911] to-pink-500/12 border border-cyan-300/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="min-w-0">
-                <p className="text-xs font-extrabold text-cyan-200">
+                <p className="text-xs font-extrabold text-cyan-300">
                   App, Store &amp; WebView Link (Browser + WebView Supported)
                 </p>
                 <p className="text-xs font-mono text-white mt-0.5 break-all">{storefrontShareUrl}</p>
                 <p className="text-[11px] text-zinc-300 mt-1">
                   Anyone can add this link inside their app, store, Android/iOS WebView, or browser — direct external API connections remain strictly blocked.
                 </p>
-                {typeof window !== 'undefined' &&
-                  (window.location.hostname.startsWith('ais-dev-') ||
-                    window.location.hostname.startsWith('ais-pre-')) && (
-                    <p className="text-[11px] font-semibold text-amber-300 mt-1">
-                      Preview URL Note: External apps ke liye AI Studio me Deploy karne ke baad milne wala Public Cloud Run URL ya apna Custom Domain (e.g. https://{normalizeCustomDomain(settings.customDomain) || 'khatushyamlearning.vercel.app'}/) add karein.
-                    </p>
-                  )}
               </div>
               <button
                 type="button"
@@ -2474,16 +3183,16 @@ export function AdminPanel({
             </div>
 
             {/* Custom Domain Setup (Anti-Clone Synced) */}
-            <div className="p-5 rounded-2xl bg-[#060810]/90 border border-cyan-400/45 shadow-[0_0_34px_-12px_rgba(56,189,248,0.45)] space-y-4">
+            <div className="p-5 rounded-2xl bg-[#070911] border border-white/15 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <Globe className="w-4 h-4 text-cyan-300 drop-shadow-[0_0_8px_rgba(56,189,248,0.85)]" />
-                  <h3 className="text-xs sm:text-sm font-extrabold text-cyan-200">
+                  <Globe className="w-4 h-4 text-pink-300" />
+                  <h3 className="text-xs sm:text-sm font-extrabold text-pink-200">
                     Custom Domain Option (Anti-Clone Authorized)
                   </h3>
                 </div>
                 {normalizeCustomDomain(settings.customDomain) && (
-                  <span className="px-2.5 py-1 rounded-lg bg-lime-400/15 border border-lime-400/50 text-[10px] font-bold text-lime-300">
+                  <span className="px-2.5 py-1 rounded-full bg-emerald-500/15 border border-lime-400/55 text-[10px] font-bold text-lime-300">
                     Active: {normalizeCustomDomain(settings.customDomain)}
                   </span>
                 )}
@@ -2507,7 +3216,7 @@ export function AdminPanel({
                     type="button"
                     disabled={checkingDns}
                     onClick={() => void handleCheckDomainDns()}
-                    className="px-3.5 py-2 rounded-xl bg-cyan-400/15 hover:bg-cyan-400/25 border border-cyan-300/50 text-xs font-bold text-cyan-200 cursor-pointer disabled:opacity-60"
+                    className="px-4 py-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-300/45 text-xs font-bold text-cyan-200 cursor-pointer disabled:opacity-60"
                   >
                     {checkingDns ? 'Checking DNS...' : 'Check DNS'}
                   </button>
@@ -2519,7 +3228,7 @@ export function AdminPanel({
                         setDnsError('');
                         setSettingsForm({ ...settingsForm, customDomain: '' });
                       }}
-                      className="px-3 py-2 rounded-xl border border-rose-400/40 text-xs font-semibold text-rose-300 hover:bg-rose-500/15 cursor-pointer"
+                      className="px-3.5 py-2 rounded-xl border border-rose-400/45 text-xs font-semibold text-rose-300 hover:bg-rose-500/15 cursor-pointer"
                     >
                       Remove
                     </button>
@@ -2535,7 +3244,7 @@ export function AdminPanel({
                 <div
                   className={`p-3 rounded-xl border text-xs space-y-1 ${
                     dnsResult.pointsToGoogleHost
-                      ? 'bg-lime-400/10 border-lime-400/45 text-lime-200'
+                      ? 'bg-emerald-500/10 border-lime-400/45 text-lime-200'
                       : dnsResult.connected
                         ? 'bg-amber-400/10 border-amber-400/45 text-amber-200'
                         : 'bg-rose-500/10 border-rose-400/45 text-rose-200'
@@ -2565,7 +3274,7 @@ export function AdminPanel({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
                   <div className="p-3 rounded-xl bg-black/45 border border-white/15 flex items-center justify-between gap-2">
                     <div className="min-w-0">
-                      <p className="text-[10px] font-bold text-pink-300">Custom Storefront Link</p>
+                      <p className="text-[10px] font-bold text-pink-200">Custom Storefront Link</p>
                       <p className="text-[11px] font-mono text-white truncate">
                         https://{normalizeCustomDomain(settingsForm.customDomain)}
                       </p>
@@ -2620,10 +3329,10 @@ export function AdminPanel({
               <div className="text-[11px] text-zinc-300 space-y-1 leading-relaxed">
                 <p>
                   <span className="font-semibold text-white">DNS Setup:</span> Point your domain/subdomain CNAME record to{' '}
-                  <code className="px-1.5 py-0.5 rounded bg-black/60 border border-white/15 text-cyan-200 font-mono">
+                  <code className="px-1.5 py-0.5 rounded bg-black/60 border border-white/15 text-cyan-300 font-mono">
                     ghs.googlehosted.com
                   </code>{' '}
-                  (and map the domain in Google Cloud Run / Cloudflare), then click <span className="text-lime-200 font-semibold">Save Storefront Settings</span> below.
+                  (and map the domain in Google Cloud Run / Cloudflare), then click <span className="text-lime-300 font-semibold">Save Storefront Settings</span> below.
                 </p>
                 <p className="text-zinc-400">
                   Saving here automatically unlocks ONLY your verified custom domain in Anti-Clone Protection while keeping all other cloned domains blocked.
@@ -2644,7 +3353,7 @@ export function AdminPanel({
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-lime-200 mb-1">Ultra-Dark Glow Theme</label>
+                <label className="block text-xs font-semibold text-lime-300 mb-1">Neon Glow Theme</label>
                 <select
                   value={settingsForm.glowTheme}
                   onChange={(e) =>
@@ -2655,10 +3364,10 @@ export function AdminPanel({
                   }
                   className={glowInputClass}
                 >
-                  <option value="amber">Multi-Glow Pink + Green</option>
-                  <option value="crimson">Pink / Crimson Glow</option>
-                  <option value="sapphire">Cyan / Sapphire Glow</option>
-                  <option value="emerald">Light Green Luminous Glow</option>
+                  <option value="amber">Neon Gold &amp; Pink</option>
+                  <option value="crimson">Neon Pink Glow</option>
+                  <option value="sapphire">Cyan Sapphire Glow</option>
+                  <option value="emerald">Lime Emerald Glow</option>
                 </select>
               </div>
             </div>
@@ -2671,7 +3380,7 @@ export function AdminPanel({
                   onChange={(e) =>
                     setSettingsForm({ ...settingsForm, showCheckmark: e.target.checked })
                   }
-                  className="accent-lime-400"
+                  className="accent-emerald-400"
                 />
                 Show Verified Checkmark beside Brand Name
               </label>
@@ -2750,33 +3459,19 @@ export function AdminPanel({
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-zinc-200 mb-1">Support WhatsApp</label>
+                <label className="block text-xs font-semibold text-lime-300 mb-1">WhatsApp Channel / Join Link</label>
                 <input
                   type="text"
-                  maxLength={40}
+                  maxLength={300}
                   value={settingsForm.supportWhatsapp}
                   onChange={(e) =>
                     setSettingsForm({ ...settingsForm, supportWhatsapp: e.target.value })
                   }
-                  className={glowCompactInputClass}
+                  placeholder="https://whatsapp.com/channel/..."
+                  className={`${glowCompactInputClass} font-mono`}
                 />
               </div>
             </div>
-
-            {!isDbAdmin && (
-              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-400/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-100">
-                <span>Connect <strong className="text-amber-300">{BOOTSTRAPPED_ADMIN_EMAIL}</strong> to save storefront settings.</span>
-                <button
-                  type="button"
-                  disabled={connectingDb}
-                  onClick={() => void handleConnectDb()}
-                  className={glowPrimaryBtnClass}
-                >
-                  <LogIn className="w-3.5 h-3.5" />
-                  {connectingDb ? 'Connecting...' : 'Connect Database Sync'}
-                </button>
-              </div>
-            )}
 
             {errorMessage && (
               <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-400/60 text-xs font-semibold text-rose-200 flex items-center gap-2">
@@ -2785,7 +3480,7 @@ export function AdminPanel({
               </div>
             )}
             {statusMessage && (
-              <div className="p-3 rounded-xl bg-lime-400/15 border border-lime-300/60 text-xs font-semibold text-lime-200 flex items-center gap-2">
+              <div className="p-3 rounded-xl bg-emerald-500/15 border border-lime-400/55 text-xs font-semibold text-lime-200 flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 text-lime-300 shrink-0" />
                 <span>{statusMessage}</span>
               </div>
@@ -2811,7 +3506,7 @@ export function AdminPanel({
           <img
             src={previewScreenshot}
             alt="Payment Screenshot"
-            className="max-w-full max-h-[85vh] rounded-2xl border border-pink-400/50 shadow-[0_0_48px_rgba(244,114,182,0.5)]"
+            className="max-w-full max-h-[85vh] rounded-3xl border border-pink-300/60 shadow-[0_0_48px_rgba(244,114,182,0.45)]"
           />
         </div>
       )}

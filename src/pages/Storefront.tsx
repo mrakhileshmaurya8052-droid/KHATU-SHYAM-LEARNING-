@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, getDocFromCache } from 'firebase/firestore';
 import {
   ArrowRight,
   CheckCircle2,
   Clock,
   Flame,
+  KeyRound,
   Loader2,
   Lock,
+  MessageCircle,
+  Rocket,
   Search,
   Send,
   ShieldCheck,
@@ -14,12 +17,17 @@ import {
   Unlock,
   X,
 } from 'lucide-react';
-import { db, FIRESTORE_UPGRADE_URL } from '../firebase';
+import { db } from '../firebase';
 import { Batch, GlowTheme, Offer, Order, SiteSettings } from '../types';
 import { VerifiedMark } from '../components/VerifiedMark';
 import { BatchThumbnail } from '../components/BatchThumbnail';
 import { BatchCheckoutModal } from '../components/BatchCheckoutModal';
 import { BatchLauncherModal } from '../components/BatchLauncherModal';
+import {
+  JoinCommunityModal,
+  resolveTelegramChannelUrl,
+  resolveWhatsappChannelUrl,
+} from '../components/JoinCommunityModal';
 
 const THEME_ACCENT: Record<
   GlowTheme,
@@ -31,23 +39,23 @@ const THEME_ACCENT: Record<
 > = {
   amber: {
     text: 'text-amber-300',
-    btn: 'bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:from-pink-300 hover:via-amber-200 hover:to-lime-200 text-zinc-950 shadow-[0_0_38px_rgba(244,114,182,0.55),0_0_24px_rgba(74,222,128,0.45)] ring-1 ring-white/50',
+    btn: 'bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 hover:brightness-105 text-zinc-950 font-extrabold shadow-[0_0_22px_-4px_rgba(244,114,182,0.55)]',
     glowCard: 'glow-card-amber border-amber-300/45',
   },
   crimson: {
     text: 'text-pink-300',
-    btn: 'bg-gradient-to-r from-pink-400 via-fuchsia-400 to-rose-400 hover:from-pink-300 hover:to-rose-300 text-zinc-950 shadow-[0_0_38px_rgba(244,114,182,0.75)] ring-1 ring-pink-200/70',
-    glowCard: 'glow-card-crimson border-pink-400/55',
+    btn: 'bg-gradient-to-r from-pink-400 via-rose-300 to-amber-200 hover:brightness-105 text-zinc-950 font-extrabold shadow-[0_0_22px_-4px_rgba(244,114,182,0.6)]',
+    glowCard: 'glow-card-crimson border-pink-400/45',
   },
   sapphire: {
     text: 'text-cyan-300',
-    btn: 'bg-gradient-to-r from-cyan-300 via-sky-400 to-pink-400 hover:from-cyan-200 hover:to-pink-300 text-zinc-950 shadow-[0_0_38px_rgba(56,189,248,0.7)] ring-1 ring-cyan-200/70',
-    glowCard: 'glow-card-sapphire border-sky-400/50',
+    btn: 'bg-gradient-to-r from-cyan-300 via-sky-300 to-lime-200 hover:brightness-105 text-zinc-950 font-extrabold shadow-[0_0_22px_-4px_rgba(56,189,248,0.6)]',
+    glowCard: 'glow-card-sapphire border-cyan-400/45',
   },
   emerald: {
     text: 'text-lime-300',
-    btn: 'bg-gradient-to-r from-lime-300 via-emerald-400 to-cyan-300 hover:from-lime-200 hover:to-cyan-200 text-zinc-950 shadow-[0_0_38px_rgba(74,222,128,0.75)] ring-1 ring-lime-200/70',
-    glowCard: 'glow-card-emerald border-lime-400/55',
+    btn: 'bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-105 text-zinc-950 font-extrabold shadow-[0_0_22px_-4px_rgba(74,222,128,0.6)]',
+    glowCard: 'glow-card-emerald border-lime-400/45',
   },
 };
 
@@ -66,12 +74,12 @@ export function Storefront({
   orders: Order[];
   loadingData: boolean;
   quotaExceeded?: boolean;
-  onOrderCreated: (orderId: string) => void;
+  onOrderCreated: (orderId: string, initialOrder?: Order) => void;
 }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeBatchModal, setActiveBatchModal] = useState<Batch | null>(null);
   const [showMyAccessModal, setShowMyAccessModal] = useState(false);
-  const [showOfferDetails, setShowOfferDetails] = useState(true);
+  const [showOfferDetails, setShowOfferDetails] = useState(false);
   const [telegramCount, setTelegramCount] = useState<number>(703);
   const [openingFreeBatchId, setOpeningFreeBatchId] = useState<string | null>(null);
   const [freeOpenError, setFreeOpenError] = useState('');
@@ -79,11 +87,12 @@ export function Storefront({
     order: Order;
     batch: Batch;
   } | null>(null);
+  const [communityModalChannel, setCommunityModalChannel] = useState<
+    'telegram' | 'whatsapp' | 'both' | null
+  >(null);
 
-  const telegramJoinUrl =
-    settings.supportTelegramUrl && settings.supportTelegramUrl !== 'https://t.me/'
-      ? settings.supportTelegramUrl
-      : 'https://t.me/Cheatestbatchwallah';
+  const telegramJoinUrl = resolveTelegramChannelUrl(settings.supportTelegramUrl);
+  const whatsappJoinUrl = resolveWhatsappChannelUrl(settings.supportWhatsapp);
 
   useEffect(() => {
     let active = true;
@@ -166,11 +175,69 @@ export function Storefront({
     try {
       let targetUrl = '';
       let accessInstructions = '';
-      const snap = await getDoc(doc(db, 'batches', batch.id, 'private', 'access'));
-      if (snap.exists()) {
-        const d = snap.data();
-        targetUrl = String(d.targetUrl || '');
-        accessInstructions = String(d.accessInstructions || '');
+      let openType = batch.openType;
+      let sealedFramePath = '';
+
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3500);
+        const res = await fetch(
+          `/api/batches/${encodeURIComponent(batch.id)}/free-access`,
+          {
+            method: 'POST',
+            credentials: 'same-origin',
+            signal: controller.signal,
+            headers: {
+              'Content-Type': 'application/json',
+              'X-KSL-Client': 'ksl-v1',
+            },
+          },
+        );
+        clearTimeout(timer);
+        if (res.ok) {
+          const data = (await res.json()) as {
+            ok?: boolean;
+            openType?: Batch['openType'];
+            unlockedUrl?: string;
+            unlockedInstructions?: string;
+            sealedFramePath?: string;
+          };
+          if (data.ok) {
+            targetUrl = String(data.unlockedUrl || '');
+            accessInstructions = String(data.unlockedInstructions || '');
+            if (data.openType) openType = data.openType;
+            if (data.sealedFramePath) sealedFramePath = String(data.sealedFramePath);
+          }
+        }
+      } catch {
+        // Fall through to cached Firestore lookup cleanly
+      }
+
+      if (!targetUrl) {
+        const ref = doc(db, 'batches', batch.id, 'private', 'access');
+        const cachedSnap = await getDocFromCache(ref).catch(() => null);
+        if (cachedSnap && cachedSnap.exists()) {
+          const d = cachedSnap.data();
+          targetUrl = String(d.targetUrl || '');
+          accessInstructions = String(d.accessInstructions || '');
+        } else {
+          const serverSnap = await Promise.race([
+            getDoc(ref).catch(() => null),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+          ]);
+          if (serverSnap && serverSnap.exists()) {
+            const d = serverSnap.data();
+            targetUrl = String(d.targetUrl || '');
+            accessInstructions = String(d.accessInstructions || '');
+          }
+        }
+      }
+
+      if (!targetUrl) {
+        setFreeOpenError(
+          'Batch link needs to be saved in Admin Panel (/ksl-admin-872) once to open live.',
+        );
+        return;
       }
 
       const virtualFreeOrder: Order = {
@@ -188,9 +255,10 @@ export function Storefront({
         studentNote: '',
         status: 'approved',
         adminNote: '',
-        openType: batch.openType,
+        openType,
         unlockedUrl: targetUrl,
         unlockedInstructions: accessInstructions,
+        ...(sealedFramePath ? { sealedFramePath } : {}),
       };
       setLauncherState({ order: virtualFreeOrder, batch });
     } catch {
@@ -214,94 +282,121 @@ export function Storefront({
   };
 
   return (
-    <div className="min-h-screen bg-[#030307] text-zinc-100 flex flex-col relative overflow-x-hidden">
-      {/* Multi-Spectrum Ultra-Glow Pink, Light Green & Cyan Ambient Lights */}
+    <div className="min-h-screen bg-[#030307] dark-hd-studio text-zinc-100 flex flex-col relative overflow-x-hidden">
+      {/* Ambient Neon Studio Lights */}
       <div className="pointer-events-none fixed inset-0 z-0">
-        <div className="absolute -top-36 left-1/4 w-[620px] h-[360px] rounded-full blur-[150px] bg-pink-500/25" />
-        <div className="absolute -top-28 right-1/4 w-[620px] h-[360px] rounded-full blur-[150px] bg-lime-400/20" />
-        <div className="absolute top-[42%] -left-32 w-[480px] h-[480px] rounded-full blur-[160px] bg-cyan-400/15" />
-        <div className="absolute bottom-0 right-[-10%] w-[540px] h-[440px] rounded-full blur-[160px] bg-fuchsia-500/15" />
+        <div className="absolute -top-40 left-1/5 w-[560px] h-[340px] rounded-full blur-[150px] bg-pink-500/14" />
+        <div className="absolute -top-32 right-1/5 w-[520px] h-[320px] rounded-full blur-[150px] bg-lime-400/10" />
+        <div className="absolute top-[42%] -left-24 w-[420px] h-[420px] rounded-full blur-[160px] bg-cyan-400/10" />
       </div>
-
-      {/* Top Pop-Up Brand Bar: ONLY KHATU SHYAM LEARNING + Checkmark */}
-      <header className="sticky top-3 z-40 px-4 sm:px-6 pointer-events-none">
-        <div className="max-w-fit mx-auto pointer-events-auto">
-          <a
-            href="#top"
-            className="relative flex items-center justify-center gap-3 px-7 sm:px-9 py-3 rounded-2xl ultra-glow-topbar backdrop-blur-2xl border border-pink-300/45 overflow-hidden transition-transform duration-200 hover:scale-[1.02]"
-          >
-            <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
-            <span className="font-display text-base sm:text-xl font-extrabold tracking-wide bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent whitespace-nowrap drop-shadow-[0_0_16px_rgba(255,255,255,0.45)]">
-              {settings.brandName}
-            </span>
-            {settings.showCheckmark && (
-              <VerifiedMark theme={settings.glowTheme} size="md" />
-            )}
-          </a>
-        </div>
-      </header>
 
       {/* Main Content */}
       <main id="top" className="flex-1 relative z-10">
-        {/* Hero Action Buttons + Limited Offer + Real-Time Telegram Card */}
-        <section className="relative border-b border-white/15">
-          <div className="max-w-4xl mx-auto px-4 sm:px-6 pt-8 pb-10 space-y-7">
-            <div className="flex flex-wrap items-center justify-center gap-4">
+        {/* Ultra-Dark Neon Hero & Quick Action Stack */}
+        <section className="relative border-b border-white/10">
+          <div className="max-w-3xl mx-auto px-4 sm:px-6 pt-8 pb-9 space-y-6">
+            {/* Brand Header */}
+            <div className="text-center space-y-3">
+              <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full ultra-glow-topbar">
+                <span className="font-display text-xs sm:text-sm font-extrabold tracking-wide bg-gradient-to-r from-pink-200 via-white to-lime-200 bg-clip-text text-transparent">
+                  {settings.brandName}
+                </span>
+                {settings.showCheckmark && (
+                  <VerifiedMark theme={settings.glowTheme} size="sm" />
+                )}
+              </div>
+
+              <h1 className="font-display text-2xl sm:text-4xl font-extrabold tracking-tight text-white leading-tight">
+                {settings.heroTitle}
+              </h1>
+              {settings.heroSubtitle && (
+                <p className="text-xs sm:text-sm text-zinc-300 max-w-xl mx-auto leading-relaxed">
+                  {settings.heroSubtitle}
+                </p>
+              )}
+            </div>
+
+            {/* Clean Neon Action Buttons & Search Stack */}
+            <div className="max-w-md mx-auto space-y-3">
+              {/* 1. Explore Live Batches */}
               <a
                 href="#batches"
-                className={`inline-flex items-center gap-2 px-7 py-3.5 rounded-xl text-sm font-extrabold transition-all whitespace-nowrap shrink-0 ${theme.btn}`}
+                className="group w-full flex items-center justify-between gap-3 px-4 py-3 rounded-2xl bg-gradient-to-r from-pink-400 via-amber-300 to-lime-300 hover:brightness-105 text-zinc-950 font-extrabold shadow-[0_0_30px_-4px_rgba(244,114,182,0.55)] transition-all active:scale-[0.99]"
               >
-                Explore Live Batches
-                <ArrowRight className="w-4 h-4" />
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-xl bg-zinc-950/15 flex items-center justify-center shrink-0">
+                    <Rocket className="w-5 h-5 text-zinc-950" />
+                  </div>
+                  <span className="font-display text-sm sm:text-base font-extrabold truncate">
+                    Explore Live Batches
+                  </span>
+                </div>
+                <ArrowRight className="w-5 h-5 shrink-0 transition-transform group-hover:translate-x-0.5" />
               </a>
+
+              {/* 2. My Batch Access */}
               <button
                 type="button"
                 onClick={() => setShowMyAccessModal(true)}
-                className="inline-flex items-center gap-2 px-6 py-3.5 rounded-xl hd-glass-surface border border-lime-300/45 hover:border-lime-300/85 shadow-[0_0_28px_-6px_rgba(74,222,128,0.5)] text-sm font-bold text-lime-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="group w-full flex items-center justify-between gap-3 px-4 py-3 rounded-2xl hd-glass-surface border border-pink-300/40 hover:border-pink-300/75 text-white shadow-[0_0_24px_-8px_rgba(244,114,182,0.38)] transition-all active:scale-[0.99] cursor-pointer"
               >
-                My Batch Access
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-xl bg-pink-500/15 border border-pink-300/40 flex items-center justify-center shrink-0">
+                    <KeyRound className="w-4 h-4 text-pink-300" />
+                  </div>
+                  <span className="font-display text-sm sm:text-base font-bold truncate">
+                    My Batch Access
+                  </span>
+                </div>
+                <ArrowRight className="w-4 h-4 text-pink-200 shrink-0 transition-transform group-hover:translate-x-0.5" />
               </button>
-            </div>
 
-            {/* Limited Offer Pill + Admin Live Offers + Join Our Telegram (Real-Time Count) */}
-            <div className="max-w-xl mx-auto space-y-4">
+              {/* 3. Limited Offer Toggle + Drawer */}
               {settings.popupEnabled && (
-                <div className="flex flex-col items-center gap-3">
+                <div className="space-y-2.5">
                   <button
                     type="button"
                     onClick={() => setShowOfferDetails((prev) => !prev)}
-                    className="inline-flex items-center gap-2.5 px-6 py-2.5 rounded-full bg-[#130D06]/95 border border-amber-400/75 shadow-[0_0_32px_rgba(251,191,36,0.5),0_0_24px_rgba(244,114,182,0.3)] hover:scale-[1.03] transition-transform cursor-pointer"
+                    className="group w-full flex items-center justify-between gap-3 px-4 py-3 rounded-2xl hd-glass-surface border border-amber-300/45 hover:border-amber-300/80 text-white shadow-[0_0_24px_-8px_rgba(251,191,36,0.35)] transition-all active:scale-[0.99] cursor-pointer"
                   >
-                    <Flame className="w-4 h-4 text-amber-400 drop-shadow-[0_0_10px_rgba(251,191,36,0.95)]" />
-                    <span className="text-sm font-extrabold tracking-wide bg-gradient-to-r from-amber-200 via-yellow-300 to-pink-200 bg-clip-text text-transparent">
-                      {settings.popupCtaText || 'Limited Offer'}
-                    </span>
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-9 h-9 rounded-xl bg-amber-400/15 border border-amber-300/40 flex items-center justify-center shrink-0">
+                        <Flame className="w-4 h-4 text-amber-300" />
+                      </div>
+                      <span className="font-display text-sm sm:text-base font-bold text-amber-200 truncate">
+                        {settings.popupCtaText || 'Limited Offer'}
+                      </span>
+                    </div>
+                    <ArrowRight
+                      className={`w-4 h-4 text-amber-200 shrink-0 transition-transform ${
+                        showOfferDetails ? 'rotate-90' : 'group-hover:translate-x-0.5'
+                      }`}
+                    />
                   </button>
 
                   {showOfferDetails && activeOffers.length > 0 && (
-                    <div className="w-full space-y-2.5">
+                    <div className="space-y-2 pt-0.5">
                       {activeOffers.map((offer) => (
                         <div
                           key={offer.id}
-                          className="relative px-4 py-3 rounded-2xl hd-glass-surface border border-amber-400/45 shadow-[0_0_30px_-8px_rgba(251,191,36,0.45),0_0_24px_-10px_rgba(244,114,182,0.35)] overflow-hidden"
+                          className="relative px-4 py-3 rounded-2xl bg-[#0B0D18] border border-amber-300/40 shadow-[0_0_24px_-8px_rgba(251,191,36,0.3)] overflow-hidden"
                         >
-                          <span className="pointer-events-none absolute inset-x-0 top-0 h-[1.5px] bg-gradient-to-r from-amber-300 via-pink-400 to-lime-300" />
                           <div className="flex items-center justify-between gap-3">
                             <div className="flex items-center gap-2.5 min-w-0">
-                              <Tag className="w-4 h-4 text-amber-300 shrink-0" />
+                              <Tag className="w-4 h-4 text-pink-300 shrink-0" />
                               <div className="min-w-0">
                                 <p className="text-xs sm:text-sm font-bold text-white truncate">
                                   {offer.title}
                                 </p>
                                 {offer.description && (
-                                  <p className="text-[11px] text-zinc-200 mt-0.5 leading-snug">
+                                  <p className="text-[11px] text-zinc-300 mt-0.5 leading-snug">
                                     {offer.description}
                                   </p>
                                 )}
                               </div>
                             </div>
                             {offer.badge && (
-                              <span className="px-2.5 py-1 rounded-lg bg-gradient-to-r from-amber-300 to-pink-400 text-zinc-950 text-[11px] font-extrabold shrink-0 shadow-[0_0_18px_rgba(251,191,36,0.5)]">
+                              <span className="px-2.5 py-1 rounded-lg bg-gradient-to-r from-pink-300 via-amber-200 to-lime-300 text-zinc-950 text-[11px] font-extrabold shrink-0">
                                 {offer.badge}
                               </span>
                             )}
@@ -313,60 +408,82 @@ export function Storefront({
                 </div>
               )}
 
-              {/* Join Our Telegram Card with Real-Time Count */}
-              <a
-                href={telegramJoinUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="group relative flex items-center justify-between gap-4 px-5 py-4 rounded-2xl hd-glass-surface border border-pink-300/40 hover:border-lime-300/80 shadow-[0_0_48px_-12px_rgba(244,114,182,0.45),0_0_38px_-12px_rgba(74,222,128,0.4)] transition-all duration-200 hover:-translate-y-0.5 overflow-hidden"
+              {/* 4. Join Our Telegram */}
+              <button
+                type="button"
+                onClick={() => setCommunityModalChannel('telegram')}
+                className="group w-full flex items-center justify-between gap-3 px-4 py-3 rounded-2xl bg-gradient-to-r from-sky-500/20 via-cyan-500/15 to-blue-600/20 border border-cyan-300/55 hover:border-cyan-200 shadow-[0_0_26px_-8px_rgba(56,189,248,0.5)] transition-all active:scale-[0.99] cursor-pointer text-left"
               >
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
-                <div className="flex items-center gap-4 min-w-0">
-                  <div className="w-12 h-12 rounded-full bg-[#090D16] border border-cyan-300/45 shadow-[0_0_24px_rgba(56,189,248,0.45)] flex items-center justify-center shrink-0">
-                    <Send className="w-5 h-5 text-cyan-300 -translate-x-0.5 translate-y-0.5" />
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-400 to-cyan-300 text-zinc-950 flex items-center justify-center shrink-0 shadow-[0_0_16px_rgba(56,189,248,0.65)]">
+                    <Send className="w-4 h-4 -translate-x-0.5" />
                   </div>
                   <div className="min-w-0">
-                    <p className="font-display text-base sm:text-lg font-extrabold text-white group-hover:text-lime-200 transition-colors truncate">
+                    <p className="font-display text-sm sm:text-base font-extrabold text-white truncate">
                       Join Our Telegram
                     </p>
-                    <div className="flex items-center gap-2 mt-0.5">
-                      <span className="w-2.5 h-2.5 rounded-full bg-lime-400 shadow-[0_0_12px_rgba(74,222,128,1)] animate-pulse shrink-0" />
-                      <span className="text-xs font-mono font-semibold tracking-wider text-zinc-200 tabular-nums">
+                    <div className="inline-flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-lime-400 shadow-[0_0_8px_#4ADE80] shrink-0" />
+                      <span className="text-[11px] font-mono font-bold tracking-wider text-cyan-200 tabular-nums">
                         {telegramCount.toLocaleString('en-IN')} JOINED
                       </span>
                     </div>
                   </div>
                 </div>
-                <div className="w-10 h-10 rounded-full bg-white/10 group-hover:bg-gradient-to-r group-hover:from-pink-400 group-hover:to-lime-300 border border-white/15 flex items-center justify-center shrink-0 transition-all">
-                  <ArrowRight className="w-4 h-4 text-white group-hover:text-zinc-950 transition-colors" />
-                </div>
-              </a>
-            </div>
-          </div>
-        </section>
+                <ArrowRight className="w-4 h-4 text-cyan-200 shrink-0 transition-transform group-hover:translate-x-0.5" />
+              </button>
 
-        {/* Batches Catalog Section */}
-        <section id="batches" className="max-w-7xl mx-auto px-4 sm:px-6 py-12 space-y-8">
-          <div className="flex items-center justify-between gap-4">
-            {/* Ultra-Matching Glow Search Bar */}
-            <div className="relative flex-1 max-w-lg group">
-              <div className="pointer-events-none absolute -inset-0.5 rounded-xl bg-gradient-to-r from-pink-500/50 via-amber-300/40 to-lime-400/55 blur-md opacity-75 group-focus-within:opacity-100 transition-opacity" />
-              <div className="relative flex items-center rounded-xl bg-[#070911]/95 border border-pink-300/55 group-focus-within:border-lime-300 shadow-[0_0_32px_-6px_rgba(244,114,182,0.55),0_0_24px_-8px_rgba(74,222,128,0.45)] overflow-hidden">
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[1.5px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
-                <Search className="w-4 h-4 text-lime-300 ml-4 shrink-0 drop-shadow-[0_0_8px_rgba(74,222,128,0.85)]" />
+              {/* 5. Join Our WhatsApp */}
+              <button
+                type="button"
+                onClick={() => setCommunityModalChannel('whatsapp')}
+                className="group w-full flex items-center justify-between gap-3 px-4 py-3 rounded-2xl bg-gradient-to-r from-emerald-500/20 via-lime-400/15 to-green-600/20 border border-lime-300/55 hover:border-lime-200 shadow-[0_0_26px_-8px_rgba(74,222,128,0.5)] transition-all active:scale-[0.99] cursor-pointer text-left"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-lime-300 to-emerald-400 text-zinc-950 flex items-center justify-center shrink-0 shadow-[0_0_16px_rgba(74,222,128,0.65)]">
+                    <MessageCircle className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="font-display text-sm sm:text-base font-extrabold text-white truncate">
+                      Join Our WhatsApp
+                    </p>
+                    <p className="text-[11px] font-mono font-bold tracking-wider text-lime-300">
+                      OFFICIAL CHANNEL
+                    </p>
+                  </div>
+                </div>
+                <ArrowRight className="w-4 h-4 text-lime-200 shrink-0 transition-transform group-hover:translate-x-0.5" />
+              </button>
+
+              {/* 6. Search Batch Name */}
+              <div className="flex items-center rounded-2xl bg-[#070911] border border-pink-300/40 focus-within:border-lime-300 shadow-[0_0_22px_-8px_rgba(244,114,182,0.3)] transition-all px-3.5 py-2.5">
+                <Search className="w-4 h-4 text-pink-300 shrink-0" />
                 <input
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search batch name..."
-                  className="w-full px-3.5 py-3 bg-transparent text-sm font-medium text-white placeholder:text-zinc-300 focus:outline-none"
+                  className="w-full px-2.5 bg-transparent text-xs sm:text-sm font-medium text-white placeholder:text-zinc-400 focus:outline-none"
                 />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    aria-label="Clear search"
+                    className="p-1 text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </div>
           </div>
+        </section>
 
+        {/* Batches Catalog Section */}
+        <section id="batches" className="max-w-7xl mx-auto px-4 sm:px-6 py-10 space-y-8">
           {freeOpenError && (
-            <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-400/50 text-xs font-semibold text-rose-200 flex items-center justify-between gap-3">
+            <div className="p-3.5 rounded-2xl bg-rose-500/15 border border-rose-400/50 text-xs font-semibold text-rose-200 flex items-center justify-between gap-3">
               <span>{freeOpenError}</span>
               <button
                 type="button"
@@ -383,36 +500,24 @@ export function Storefront({
               {[1, 2, 3].map((n) => (
                 <div
                   key={n}
-                  className="h-80 rounded-2xl hd-glass-surface border border-white/15 animate-pulse"
+                  className="h-80 rounded-2xl hd-glass-surface border border-white/10 animate-pulse"
                 />
               ))}
             </div>
           ) : filteredBatches.length === 0 ? (
-            <div className="p-12 rounded-2xl hd-glass-surface border border-pink-300/30 text-center space-y-3">
-              <p className="text-base font-semibold text-white">
+            <div className="p-12 rounded-3xl hd-glass-surface border border-pink-300/35 text-center space-y-3">
+              <p className="text-base font-bold text-white">
                 {searchQuery.trim()
                   ? 'No batches match your search'
-                  : quotaExceeded
-                    ? 'Database Daily Read Quota Reached'
-                    : 'No batches published yet'}
+                  : 'No batches published yet'}
               </p>
-              <p className="text-xs text-zinc-300 max-w-lg mx-auto leading-relaxed">
+              <p className="text-xs text-zinc-400 max-w-lg mx-auto leading-relaxed">
                 {searchQuery.trim()
                   ? 'Try clearing your search to view all batches.'
                   : quotaExceeded
-                    ? 'Firebase free daily read units for this database have reached their daily limit (resets tomorrow; see Spark plan details under Enterprise edition at firebase.google.com/pricing#cloud-firestore).'
+                    ? 'Older Firebase batches are temporarily paused due to daily free read limits. Any new batch published in Admin Panel will appear here live right away.'
                     : 'Batches published from the Admin Panel will appear here automatically.'}
               </p>
-              {!searchQuery.trim() && quotaExceeded && (
-                <a
-                  href={FIRESTORE_UPGRADE_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-amber-400/20 border border-amber-300/60 text-xs font-bold text-amber-200 hover:bg-amber-400/30"
-                >
-                  Open Firebase Database Upgrade Dialog
-                </a>
-              )}
             </div>
           ) : (
             (() => {
@@ -447,7 +552,7 @@ export function Storefront({
                   <article
                     key={batch.id}
                     onClick={() => handleBatchCardClick(batch)}
-                    className={`group relative cursor-pointer rounded-2xl hd-glass-surface border overflow-hidden transition-transform duration-200 hover:-translate-y-1 ${cardAccent.glowCard} ${sizeColClass}`}
+                    className={`group relative cursor-pointer rounded-2xl hd-glass-surface border overflow-hidden transition-all duration-200 hover:-translate-y-1 ${sizeColClass} ${cardAccent.glowCard}`}
                   >
                     <div className="relative">
                       <BatchThumbnail
@@ -459,27 +564,27 @@ export function Storefront({
                       />
                       <div className="absolute top-3 right-3 z-10">
                         {isFree ? (
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#050A08]/85 backdrop-blur-md border border-lime-400/75 text-lime-300 text-[11px] font-bold shadow-[0_0_20px_rgba(74,222,128,0.55)]">
-                            <Unlock className="w-3.5 h-3.5" />
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[#051810]/90 backdrop-blur-md border border-lime-400/55 text-lime-300 text-[11px] font-bold shadow-[0_4px_16px_rgba(74,222,128,0.35)]">
+                            <Unlock className="w-3 h-3" />
                             Free
                           </span>
                         ) : isApproved ? (
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#050A08]/85 backdrop-blur-md border border-lime-400/70 text-lime-300 text-[11px] font-bold shadow-[0_0_20px_rgba(74,222,128,0.5)]">
-                            <Unlock className="w-3.5 h-3.5" />
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[#051810]/90 backdrop-blur-md border border-lime-400/55 text-lime-300 text-[11px] font-bold shadow-[0_4px_16px_rgba(74,222,128,0.35)]">
+                            <Unlock className="w-3 h-3" />
                             Unlocked
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#09060D]/85 backdrop-blur-md border border-pink-400/65 text-pink-200 text-[11px] font-bold shadow-[0_0_20px_rgba(244,114,182,0.45)]">
-                            <Lock className="w-3.5 h-3.5 text-pink-300" />
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-[#070911]/90 backdrop-blur-md border border-white/20 text-zinc-100 text-[11px] font-semibold shadow-lg">
+                            <Lock className="w-3 h-3 text-zinc-300" />
                             Locked
                           </span>
                         )}
                       </div>
                     </div>
 
-                    <div className="p-5 sm:p-6 space-y-4">
+                    <div className="p-5 space-y-4 bg-[#070911]">
                       <div className="flex items-center gap-2.5">
-                        <h3 className="font-display text-lg sm:text-xl font-bold text-white leading-snug group-hover:text-pink-200 transition-colors">
+                        <h3 className="font-display text-lg sm:text-xl font-extrabold text-white leading-snug group-hover:text-pink-100 transition-colors">
                           {batch.title}
                         </h3>
                         {batch.showCheckmark !== false && (
@@ -491,13 +596,11 @@ export function Storefront({
                         )}
                       </div>
 
-                      <div className="flex items-center justify-between gap-4 pt-3.5 border-t border-white/15">
+                      <div className="flex items-center justify-between gap-4 pt-3.5 border-t border-white/10">
                         <div className="flex items-baseline gap-2.5">
                           <span
                             className={`text-2xl font-extrabold font-mono tabular-nums ${
-                              isFree
-                                ? 'text-lime-300 drop-shadow-[0_0_16px_rgba(74,222,128,0.65)]'
-                                : 'text-white drop-shadow-[0_0_14px_rgba(255,255,255,0.4)]'
+                              isFree ? 'text-lime-300' : 'text-white'
                             }`}
                           >
                             {isFree
@@ -505,12 +608,12 @@ export function Storefront({
                               : `₹${batch.price.toLocaleString('en-IN')}`}
                           </span>
                           {batch.originalPrice > batch.price && (
-                            <span className="text-xs font-mono tabular-nums text-zinc-400 line-through">
+                            <span className="text-xs font-mono tabular-nums text-zinc-500 line-through">
                               ₹{batch.originalPrice.toLocaleString('en-IN')}
                             </span>
                           )}
                           {discountPct > 0 && !isFree && (
-                            <span className="text-xs font-extrabold text-lime-300 drop-shadow-[0_0_10px_rgba(74,222,128,0.75)]">
+                            <span className="text-xs font-bold text-lime-300">
                               {discountPct}% Off
                             </span>
                           )}
@@ -524,7 +627,7 @@ export function Storefront({
                               e.stopPropagation();
                               void handleOpenFreeBatch(batch);
                             }}
-                            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-gradient-to-r from-lime-300 via-emerald-400 to-cyan-300 hover:from-lime-200 hover:to-cyan-200 text-zinc-950 text-xs font-extrabold shadow-[0_0_28px_rgba(74,222,128,0.75)] transition-all whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-70"
+                            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-105 text-zinc-950 text-xs font-extrabold shadow-[0_0_24px_-4px_rgba(52,211,153,0.6)] transition-all whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-70"
                           >
                             {isOpeningFree ? (
                               <Loader2 className="w-4 h-4 animate-spin" />
@@ -540,13 +643,13 @@ export function Storefront({
                               e.stopPropagation();
                               if (order) setLauncherState({ order, batch });
                             }}
-                            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-gradient-to-r from-lime-300 via-emerald-400 to-teal-300 hover:from-lime-200 hover:to-teal-200 text-zinc-950 text-xs font-extrabold shadow-[0_0_28px_rgba(74,222,128,0.75)] transition-all whitespace-nowrap shrink-0"
+                            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-105 text-zinc-950 text-xs font-extrabold shadow-[0_0_24px_-4px_rgba(52,211,153,0.6)] transition-all whitespace-nowrap shrink-0 cursor-pointer"
                           >
                             <CheckCircle2 className="w-4 h-4" />
                             Open Batch
                           </button>
                         ) : isPending ? (
-                          <span className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-pink-500/20 border border-pink-400/60 text-pink-200 text-xs font-semibold shadow-[0_0_20px_rgba(244,114,182,0.35)] whitespace-nowrap shrink-0">
+                          <span className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-amber-400/15 border border-amber-300/45 text-amber-200 text-xs font-bold whitespace-nowrap shrink-0">
                             <Clock className="w-3.5 h-3.5" />
                             Pending Approval
                           </span>
@@ -557,7 +660,7 @@ export function Storefront({
                               e.stopPropagation();
                               setActiveBatchModal(batch);
                             }}
-                            className={`inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-xs font-extrabold transition-all whitespace-nowrap shrink-0 ${cardAccent.btn}`}
+                            className={`inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-xs transition-all whitespace-nowrap shrink-0 cursor-pointer ${cardAccent.btn}`}
                           >
                             <Lock className="w-3.5 h-3.5" />
                             Buy Now
@@ -570,7 +673,7 @@ export function Storefront({
               };
 
               return (
-                <div className="space-y-7">
+                <div className="space-y-8">
                   {directOpenBatches.length > 0 && (
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-7 items-start">
                       {directOpenBatches.map(renderBatchCard)}
@@ -588,26 +691,14 @@ export function Storefront({
         </section>
       </main>
 
-      {/* Footer */}
-      <footer id="support" className="relative z-10 border-t border-white/15 bg-[#030307] py-8 px-4 sm:px-6">
-        <div
-          className={`max-w-7xl mx-auto flex flex-col sm:flex-row items-center gap-4 text-xs text-zinc-200 ${
-            settings.supportWhatsapp ? 'justify-between' : 'justify-center'
-          }`}
-        >
-          <div className="flex items-center gap-2">
-            <span className="font-display font-bold text-white">
-              {settings.brandName}
-            </span>
-            {settings.showCheckmark && (
-              <VerifiedMark theme={settings.glowTheme} size="sm" />
-            )}
-          </div>
-
-          {settings.supportWhatsapp && (
-            <div className="flex flex-wrap items-center gap-5">
-              <span>WhatsApp: {settings.supportWhatsapp}</span>
-            </div>
+      {/* Clean Minimal Dark Footer */}
+      <footer id="support" className="relative z-10 bg-[#030307] border-t border-white/10 py-8 px-4 sm:px-6">
+        <div className="max-w-7xl mx-auto flex items-center justify-center gap-2.5 text-xs text-white">
+          <span className="font-display font-extrabold tracking-wide text-white">
+            {settings.brandName}
+          </span>
+          {settings.showCheckmark && (
+            <VerifiedMark theme={settings.glowTheme} size="sm" />
           )}
         </div>
       </footer>
@@ -630,33 +721,36 @@ export function Storefront({
       {/* My Batch Access Modal */}
       {showMyAccessModal && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/82 backdrop-blur-md"
           onClick={() => setShowMyAccessModal(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="relative w-full max-w-xl rounded-2xl hd-glass-surface border border-lime-300/45 shadow-[0_0_64px_-12px_rgba(74,222,128,0.55),0_0_48px_-14px_rgba(244,114,182,0.45)] overflow-hidden"
+            className="relative w-full max-w-xl rounded-3xl bg-[#070911] border border-pink-300/40 shadow-[0_24px_70px_-10px_rgba(0,0,0,0.96),0_0_46px_-8px_rgba(244,114,182,0.42)] overflow-hidden"
           >
             <span className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-pink-400 via-white to-lime-300" />
-            <div className="flex items-center justify-between px-6 py-4 border-b border-white/15">
-              <h2 className="font-display text-lg font-bold bg-gradient-to-r from-lime-200 via-white to-pink-200 bg-clip-text text-transparent">
-                My Batch Access
-              </h2>
+            <div className="flex items-center justify-between px-6 py-4 bg-[#0B0D18] border-b border-white/10">
+              <div className="flex items-center gap-2">
+                <KeyRound className="w-5 h-5 text-pink-300" />
+                <h2 className="font-display text-lg font-extrabold text-white">
+                  My Batch Access
+                </h2>
+              </div>
               <button
                 type="button"
                 onClick={() => setShowMyAccessModal(false)}
                 aria-label="Close My Batch Access"
-                className="p-1.5 rounded-lg text-zinc-300 hover:text-white hover:bg-white/10 transition-colors"
+                className="p-1.5 rounded-xl border border-white/15 text-zinc-300 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="p-6 max-h-[70vh] overflow-y-auto space-y-3">
+            <div className="p-6 max-h-[70vh] overflow-y-auto space-y-3 bg-[#070911]">
               {orders.length === 0 ? (
-                <div className="p-6 rounded-xl bg-white/[0.04] border border-white/15 text-center space-y-2">
+                <div className="p-6 rounded-2xl bg-[#0C0F1C] border border-white/10 text-center space-y-2">
                   <p className="text-sm font-semibold text-white">No active batch purchases yet</p>
-                  <p className="text-xs text-zinc-300">
+                  <p className="text-xs text-zinc-400">
                     Tap any batch thumbnail and submit payment to unlock access here.
                   </p>
                 </div>
@@ -666,7 +760,7 @@ export function Storefront({
                   return (
                     <div
                       key={ord.id}
-                      className="p-4 rounded-xl bg-white/[0.04] border border-pink-400/35 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+                      className="p-4 rounded-2xl bg-[#0C0F1C] border border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
                     >
                       <div className="space-y-1 min-w-0">
                         <div className="flex items-center gap-2 text-xs">
@@ -675,7 +769,7 @@ export function Storefront({
                               ord.status === 'approved'
                                 ? 'text-lime-300'
                                 : ord.status === 'rejected'
-                                  ? 'text-pink-400'
+                                  ? 'text-rose-400'
                                   : 'text-amber-300'
                             }`}
                           >
@@ -685,7 +779,7 @@ export function Storefront({
                                 ? 'Declined'
                                 : 'Pending Approval'}
                           </span>
-                          <span className="text-zinc-600" aria-hidden="true">
+                          <span className="text-zinc-500" aria-hidden="true">
                             ·
                           </span>
                           <span className="font-mono text-zinc-300 truncate">
@@ -695,7 +789,7 @@ export function Storefront({
                         <h3 className="text-sm font-bold text-white truncate">
                           {ord.batchTitle}
                         </h3>
-                        <p className="text-xs text-zinc-300">
+                        <p className="text-xs text-zinc-400">
                           ₹{ord.amount.toLocaleString('en-IN')}
                           {ord.planLabel ? ` · ${ord.planLabel}` : ''} · {ord.paymentMethod}
                         </p>
@@ -713,7 +807,7 @@ export function Storefront({
                             setShowMyAccessModal(false);
                             setLauncherState({ order: ord, batch: matchedBatch });
                           }}
-                          className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-gradient-to-r from-lime-300 to-emerald-400 hover:from-lime-200 hover:to-emerald-300 text-zinc-950 text-xs font-extrabold shadow-[0_0_24px_rgba(74,222,128,0.65)] whitespace-nowrap shrink-0"
+                          className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 text-zinc-950 text-xs font-extrabold shadow-[0_0_22px_-4px_rgba(52,211,153,0.55)] whitespace-nowrap shrink-0 cursor-pointer"
                         >
                           <ShieldCheck className="w-4 h-4" />
                           Open Batch
@@ -725,13 +819,13 @@ export function Storefront({
                             setShowMyAccessModal(false);
                             setActiveBatchModal(matchedBatch);
                           }}
-                          className={`px-4 py-2.5 rounded-xl text-xs font-extrabold whitespace-nowrap shrink-0 ${theme.btn}`}
+                          className={`px-4 py-2.5 rounded-xl text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer ${theme.btn}`}
                         >
                           Resubmit
                         </button>
                       ) : (
-                        <span className="inline-flex items-center gap-1.5 text-xs text-pink-200 font-medium shrink-0">
-                          <Lock className="w-3.5 h-3.5 text-pink-300" /> Locked until Approved
+                        <span className="inline-flex items-center gap-1.5 text-xs text-zinc-300 font-medium shrink-0">
+                          <Lock className="w-3.5 h-3.5 text-amber-300" /> Locked until Approved
                         </span>
                       )}
                     </div>
@@ -748,7 +842,21 @@ export function Storefront({
         <BatchLauncherModal
           order={launcherState.order}
           batch={launcherState.batch}
+          settings={settings}
           onClose={() => setLauncherState(null)}
+        />
+      )}
+
+      {/* Official Telegram & WhatsApp Join Popup */}
+      {communityModalChannel && (
+        <JoinCommunityModal
+          brandName={settings.brandName}
+          showCheckmark={settings.showCheckmark}
+          glowTheme={settings.glowTheme}
+          telegramUrl={telegramJoinUrl}
+          whatsappUrl={whatsappJoinUrl}
+          focusChannel={communityModalChannel}
+          onClose={() => setCommunityModalChannel(null)}
         />
       )}
     </div>

@@ -4,6 +4,8 @@ const ALLOWED_HOST_SUFFIXES = [
   '.firebaseapp.com',
   '.google.com',
   '.googleusercontent.com',
+  '.usercontent.goog',
+  '.gstatic.com',
 ];
 
 const ALLOWED_EXACT_HOSTS = [

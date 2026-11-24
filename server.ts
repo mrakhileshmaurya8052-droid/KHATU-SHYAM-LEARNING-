@@ -202,7 +202,78 @@ const AUTHORIZED_CUSTOM_HOSTS = [
   'www.khatushyamlearning.vercel.app',
   'khatushyamlearning.publicvm.com',
   'www.khatushyamlearning.publicvm.com',
+  'gen-lang-client-0442544308.web.app',
+  'gen-lang-client-0442544308.firebaseapp.com',
 ];
+
+const AUTHORIZED_HOST_SUFFIXES = [
+  '.run.app',
+  '.web.app',
+  '.firebaseapp.com',
+  '.googleusercontent.com',
+];
+
+let runtimeCustomHosts: string[] = [];
+
+function syncRuntimeCustomHosts(customDomainValue: unknown): void {
+  if (typeof customDomainValue !== 'string') {
+    runtimeCustomHosts = [];
+    return;
+  }
+  const cleaned = customDomainValue
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .split('/')[0]
+    .split('?')[0]
+    .split('#')[0]
+    .split(':')[0]
+    .replace(/^\.+|\.+$/g, '');
+  if (!cleaned) {
+    runtimeCustomHosts = [];
+    return;
+  }
+  runtimeCustomHosts = cleaned.startsWith('www.')
+    ? [cleaned, cleaned.slice(4)]
+    : [cleaned, `www.${cleaned}`];
+}
+
+function getRequestCandidateHosts(req: Request): string[] {
+  const fwdHeader = req.get('forwarded') || '';
+  const fwdHostMatch = fwdHeader.match(/host=([^;,\s"]+)/i);
+  const xFwdHosts = (req.get('x-forwarded-host') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  return [
+    req.get('host'),
+    req.get('x-original-host'),
+    fwdHostMatch?.[1],
+    ...xFwdHosts,
+    ...AUTHORIZED_CUSTOM_HOSTS,
+    ...runtimeCustomHosts,
+  ].filter((h): h is string => Boolean(h));
+}
+
+function isAuthorizedAppUrl(urlStr: string, candidateHosts: string[]): boolean {
+  if (candidateHosts.some((h) => isHostMatch(urlStr, h))) {
+    return true;
+  }
+  try {
+    const parsed = new URL(urlStr);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {
+      return true;
+    }
+    if (AUTHORIZED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 function apiSecurityGuard(req: Request, res: Response, next: NextFunction): void {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
@@ -217,30 +288,31 @@ function apiSecurityGuard(req: Request, res: Response, next: NextFunction): void
     return;
   }
 
-  const candidateHosts = [
-    req.get('host'),
-    req.get('x-forwarded-host')?.split(',')[0]?.trim(),
-    ...AUTHORIZED_CUSTOM_HOSTS,
-  ].filter((h): h is string => Boolean(h));
-
-  const matchesAnyHost = (urlStr: string) =>
-    candidateHosts.some((h) => isHostMatch(urlStr, h));
+  const candidateHosts = getRequestCandidateHosts(req);
+  const matchesAnyHost = (urlStr: string) => isAuthorizedAppUrl(urlStr, candidateHosts);
 
   const origin = req.get('origin');
   const referer = req.get('referer');
 
   if (origin && !matchesAnyHost(origin)) {
+    console.warn('[apiSecurityGuard] Blocked origin:', req.method, req.path, { origin, host: req.get('host') });
     res.status(403).json({ error: 'Forbidden origin.' });
-    return;
-  }
-
-  if (referer && !matchesAnyHost(referer)) {
-    res.status(403).json({ error: 'Invalid request referer.' });
     return;
   }
 
   const hasSameHostOrigin = Boolean(origin && matchesAnyHost(origin));
   const hasSameHostReferer = Boolean(referer && matchesAnyHost(referer));
+
+  if (referer && !hasSameHostReferer && !hasSameHostOrigin) {
+    const refLower = referer.toLowerCase();
+    // Allow native Android WebView app package referers on GET requests, block foreign web referers
+    if (!(req.method === 'GET' && refLower.startsWith('android-app://'))) {
+      console.warn('[apiSecurityGuard] Blocked referer:', req.method, req.path, { referer, origin });
+      res.status(403).json({ error: 'Invalid request referer.' });
+      return;
+    }
+  }
+
   const secFetchSite = req.get('sec-fetch-site');
   if (
     secFetchSite &&
@@ -248,6 +320,7 @@ function apiSecurityGuard(req: Request, res: Response, next: NextFunction): void
     secFetchSite !== 'none' &&
     !(hasSameHostOrigin || hasSameHostReferer)
   ) {
+    console.warn('[apiSecurityGuard] Blocked sec-fetch-site:', req.method, req.path, { secFetchSite, origin, referer });
     res.status(403).json({ error: 'Cross-site API requests are blocked.' });
     return;
   }
@@ -440,6 +513,7 @@ const BLOCKED_SENSITIVE_PATTERNS = [
   /\.map$/i,
   /^\/\.env/i,
   /^\/\.git/i,
+  /^\/\.data/i,
   /^\/server\.ts$/i,
   /^\/package(?:-lock)?\.json$/i,
   /^\/tsconfig\.json$/i,
@@ -488,47 +562,125 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '64kb' }));
+  app.use(express.json({ limit: '4mb' }));
 
   // Harden every /api/* endpoint against external cloning / cross-origin connections
   app.use('/api', apiSecurityGuard);
 
-  const CATALOG_CACHE_PATH = path.join(os.tmpdir(), 'ksl-catalog-cache.json');
-  const CATALOG_CACHE_TTL_MS = 120_000;
+  const DATA_DIR = path.resolve(__dirname, '.data');
+  const STORE_FILE = path.join(DATA_DIR, 'ksl-store.json');
+  const FALLBACK_TMP_STORE = path.join(os.tmpdir(), 'ksl-store-fallback.json');
+  const LEGACY_TMP_CACHE = path.join(os.tmpdir(), 'ksl-catalog-cache.json');
 
-  interface CatalogSnapshot {
+  interface StoredBatchSecret {
+    targetUrl: string;
+    accessInstructions: string;
+    updatedAt: string;
+  }
+
+  interface ServerStore {
     settings: Record<string, unknown> | null;
     batches: Record<string, unknown>[];
+    batchSecrets: Record<string, StoredBatchSecret>;
     offers: Record<string, unknown>[];
+    orders: Record<string, unknown>[];
+    deletedBatchIds: string[];
+    deletedOfferIds: string[];
+    firestoreSynced: boolean;
     updatedAt: number;
   }
 
-  let catalogCache: CatalogSnapshot | null = (() => {
+  const ensureStoreDir = () => {
     try {
-      if (!fs.existsSync(CATALOG_CACHE_PATH)) return null;
-      const parsed = JSON.parse(fs.readFileSync(CATALOG_CACHE_PATH, 'utf8')) as Partial<CatalogSnapshot>;
-      if (parsed && Array.isArray(parsed.batches) && Array.isArray(parsed.offers)) {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  let storeState: ServerStore = (() => {
+    ensureStoreDir();
+    try {
+      const sourceFile = fs.existsSync(STORE_FILE)
+        ? STORE_FILE
+        : fs.existsSync(FALLBACK_TMP_STORE)
+          ? FALLBACK_TMP_STORE
+          : '';
+      if (sourceFile) {
+        const parsed = JSON.parse(fs.readFileSync(sourceFile, 'utf8')) as Partial<ServerStore>;
         return {
           settings: parsed.settings ?? null,
-          batches: parsed.batches,
-          offers: parsed.offers,
-          updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+          batches: Array.isArray(parsed.batches) ? parsed.batches : [],
+          batchSecrets:
+            parsed.batchSecrets && typeof parsed.batchSecrets === 'object'
+              ? parsed.batchSecrets
+              : {},
+          offers: Array.isArray(parsed.offers) ? parsed.offers : [],
+          orders: Array.isArray(parsed.orders) ? parsed.orders : [],
+          deletedBatchIds: Array.isArray(parsed.deletedBatchIds) ? parsed.deletedBatchIds : [],
+          deletedOfferIds: Array.isArray(parsed.deletedOfferIds) ? parsed.deletedOfferIds : [],
+          firestoreSynced: Boolean(parsed.firestoreSynced),
+          updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
+        };
+      }
+      if (fs.existsSync(LEGACY_TMP_CACHE)) {
+        const legacy = JSON.parse(fs.readFileSync(LEGACY_TMP_CACHE, 'utf8')) as {
+          settings?: Record<string, unknown> | null;
+          batches?: Record<string, unknown>[];
+          offers?: Record<string, unknown>[];
+        };
+        return {
+          settings: legacy.settings ?? null,
+          batches: Array.isArray(legacy.batches) ? legacy.batches : [],
+          batchSecrets: {},
+          offers: Array.isArray(legacy.offers) ? legacy.offers : [],
+          orders: [],
+          deletedBatchIds: [],
+          deletedOfferIds: [],
+          firestoreSynced: false,
+          updatedAt: Date.now(),
         };
       }
     } catch {
-      // Ignore corrupt disk cache
+      // Fall back to empty store
     }
-    return null;
+    return {
+      settings: null,
+      batches: [],
+      batchSecrets: {},
+      offers: [],
+      orders: [],
+      deletedBatchIds: [],
+      deletedOfferIds: [],
+      firestoreSynced: false,
+      updatedAt: Date.now(),
+    };
   })();
 
-  const saveCatalogCache = (next: CatalogSnapshot) => {
-    catalogCache = next;
+  syncRuntimeCustomHosts(storeState.settings?.customDomain);
+
+  const persistStore = () => {
+    storeState.updatedAt = Date.now();
+    syncRuntimeCustomHosts(storeState.settings?.customDomain);
+    ensureStoreDir();
+    const serialized = JSON.stringify(storeState);
     try {
-      fs.writeFileSync(CATALOG_CACHE_PATH, JSON.stringify(next), 'utf8');
+      const tmpPath = `${STORE_FILE}.tmp`;
+      fs.writeFileSync(tmpPath, serialized, 'utf8');
+      fs.renameSync(tmpPath, STORE_FILE);
     } catch {
-      // Ignore ephemeral filesystem errors
+      try {
+        fs.writeFileSync(FALLBACK_TMP_STORE, serialized, 'utf8');
+      } catch {
+        // Ignore write error if both are unavailable
+      }
     }
   };
+
+  let lastFirestoreSyncAttempt = 0;
+  let lastFirestoreQuotaBlocked = false;
 
   const getFirebaseConfigMeta = (): { projectId: string; databaseId: string } | null => {
     try {
@@ -581,74 +733,80 @@ async function startServer() {
     return decoded;
   };
 
-  app.get('/api/public-catalog', async (req, res) => {
-    const ip = getClientIp(req);
-    const rate = checkRateBucket(`cat:${ip}`, 60_000, 120);
-    if (!rate.allowed) {
-      res.status(429).json({ error: `Rate limit exceeded. Retry in ${rate.retryAfterSec}s.` });
-      return;
+  const parseTimestampMs = (value: unknown): number => {
+    if (typeof value === 'string') {
+      const ms = Date.parse(value);
+      return Number.isFinite(ms) ? ms : 0;
     }
-
-    const forceRefresh = req.query.refresh === '1';
-    if (!forceRefresh && catalogCache && Date.now() - catalogCache.updatedAt < CATALOG_CACHE_TTL_MS) {
-      res.json({
-        ok: true,
-        source: 'cache',
-        settings: catalogCache.settings,
-        batches: catalogCache.batches,
-        offers: catalogCache.offers,
-      });
-      return;
+    if (value && typeof value === 'object' && 'seconds' in value) {
+      const sec = Number((value as { seconds?: number }).seconds || 0);
+      return Number.isFinite(sec) ? sec * 1000 : 0;
     }
+    return 0;
+  };
 
+  const trySyncFromFirestoreIfNeeded = async (force = false): Promise<{
+    synced: boolean;
+    quotaExceeded: boolean;
+    addedBatches: number;
+    addedOffers: number;
+  }> => {
+    const cooldownMs = lastFirestoreQuotaBlocked
+      ? 180_000
+      : storeState.firestoreSynced && storeState.batches.length > 0
+        ? 300_000
+        : 15_000;
+    if (!force && Date.now() - lastFirestoreSyncAttempt < cooldownMs) {
+      return {
+        synced: storeState.firestoreSynced,
+        quotaExceeded: lastFirestoreQuotaBlocked,
+        addedBatches: 0,
+        addedOffers: 0,
+      };
+    }
+    lastFirestoreSyncAttempt = Date.now();
     const meta = getFirebaseConfigMeta();
     if (!meta) {
-      if (catalogCache) {
-        res.json({
-          ok: true,
-          source: 'stale-cache',
-          settings: catalogCache.settings,
-          batches: catalogCache.batches,
-          offers: catalogCache.offers,
-        });
-        return;
-      }
-      res.status(503).json({ ok: false, error: 'Database configuration unavailable.' });
-      return;
+      return { synced: storeState.firestoreSynced, quotaExceeded: false, addedBatches: 0, addedOffers: 0 };
     }
 
     const base = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(meta.projectId)}/databases/${encodeURIComponent(meta.databaseId)}/documents`;
     try {
       const [settingsRes, batchesRes, offersRes] = await Promise.all([
-        fetch(`${base}/site_settings/global`, { signal: AbortSignal.timeout(5000) }),
-        fetch(`${base}/batches?pageSize=100`, { signal: AbortSignal.timeout(5000) }),
-        fetch(`${base}/offers?pageSize=100`, { signal: AbortSignal.timeout(5000) }),
+        fetch(`${base}/site_settings/global`, { signal: AbortSignal.timeout(5500) }),
+        fetch(`${base}:runQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            structuredQuery: {
+              from: [{ collectionId: 'batches' }],
+              limit: 250,
+            },
+          }),
+          signal: AbortSignal.timeout(5500),
+        }),
+        fetch(`${base}:runQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            structuredQuery: {
+              from: [{ collectionId: 'offers' }],
+              limit: 100,
+            },
+          }),
+          signal: AbortSignal.timeout(5500),
+        }),
       ]);
-
-      const anyQuotaExceeded =
-        settingsRes.status === 429 || batchesRes.status === 429 || offersRes.status === 429;
-
-      if (anyQuotaExceeded) {
-        if (catalogCache && (catalogCache.batches.length > 0 || catalogCache.settings)) {
-          res.json({
-            ok: true,
-            source: 'stale-cache',
-            quotaLimited: true,
-            settings: catalogCache.settings,
-            batches: catalogCache.batches,
-            offers: catalogCache.offers,
-          });
-          return;
-        }
-        res.status(503).json({
-          ok: false,
-          quotaExceeded: true,
-          error: 'Firestore daily free quota exceeded.',
-        });
-        return;
+      if (settingsRes.status === 429 || batchesRes.status === 429 || offersRes.status === 429) {
+        lastFirestoreQuotaBlocked = true;
+        return { synced: storeState.firestoreSynced, quotaExceeded: true, addedBatches: 0, addedOffers: 0 };
       }
 
-      let nextSettings: Record<string, unknown> | null = catalogCache?.settings ?? null;
+      lastFirestoreQuotaBlocked = false;
+      let changed = false;
+      let addedBatches = 0;
+      let addedOffers = 0;
+
       if (settingsRes.ok) {
         const sJson = (await settingsRes.json()) as {
           name?: string;
@@ -657,57 +815,563 @@ async function startServer() {
         if (sJson.fields) {
           const decoded = decodeFirestoreDocument(sJson);
           delete decoded.id;
-          nextSettings = decoded;
+          const remoteMs = parseTimestampMs(decoded.updatedAt);
+          const localMs = parseTimestampMs(storeState.settings?.updatedAt);
+          if (!storeState.settings || force || remoteMs > localMs) {
+            storeState.settings = decoded;
+            changed = true;
+          }
         }
       }
 
-      let nextBatches: Record<string, unknown>[] = catalogCache?.batches ?? [];
       if (batchesRes.ok) {
-        const bJson = (await batchesRes.json()) as {
-          documents?: Array<{ name?: string; fields?: Record<string, Record<string, unknown>> }>;
-        };
-        nextBatches = Array.isArray(bJson.documents)
-          ? bJson.documents.map((d) => decodeFirestoreDocument(d))
-          : [];
+        const bRows = (await batchesRes.json()) as Array<{
+          document?: { name?: string; fields?: Record<string, Record<string, unknown>> };
+        }>;
+        if (Array.isArray(bRows)) {
+          const indexById = new Map<string, number>();
+          storeState.batches.forEach((b, idx) => indexById.set(String(b.id || ''), idx));
+          const deletedIds = new Set(storeState.deletedBatchIds);
+
+          for (const row of bRows) {
+            if (!row?.document) continue;
+            const item = decodeFirestoreDocument(row.document);
+            const id = String(item.id || '');
+            if (!id) continue;
+            const existingIdx = indexById.get(id);
+            if (existingIdx === undefined) {
+              if (force || !deletedIds.has(id)) {
+                if (force && deletedIds.has(id)) {
+                  storeState.deletedBatchIds = storeState.deletedBatchIds.filter((d) => d !== id);
+                }
+                indexById.set(id, storeState.batches.length);
+                storeState.batches.push(item);
+                addedBatches += 1;
+                changed = true;
+              }
+            } else {
+              const localItem = storeState.batches[existingIdx];
+              const remoteMs = parseTimestampMs(item.updatedAt);
+              const localMs = parseTimestampMs(localItem?.updatedAt);
+              if (remoteMs > localMs) {
+                storeState.batches[existingIdx] = item;
+                changed = true;
+              }
+            }
+          }
+        }
       }
 
-      let nextOffers: Record<string, unknown>[] = catalogCache?.offers ?? [];
       if (offersRes.ok) {
-        const oJson = (await offersRes.json()) as {
-          documents?: Array<{ name?: string; fields?: Record<string, Record<string, unknown>> }>;
-        };
-        nextOffers = Array.isArray(oJson.documents)
-          ? oJson.documents.map((d) => decodeFirestoreDocument(d))
-          : [];
+        const oRows = (await offersRes.json()) as Array<{
+          document?: { name?: string; fields?: Record<string, Record<string, unknown>> };
+        }>;
+        if (Array.isArray(oRows)) {
+          const indexById = new Map<string, number>();
+          storeState.offers.forEach((o, idx) => indexById.set(String(o.id || ''), idx));
+          const deletedIds = new Set(storeState.deletedOfferIds);
+
+          for (const row of oRows) {
+            if (!row?.document) continue;
+            const item = decodeFirestoreDocument(row.document);
+            const id = String(item.id || '');
+            if (!id) continue;
+            const existingIdx = indexById.get(id);
+            if (existingIdx === undefined) {
+              if (force || !deletedIds.has(id)) {
+                if (force && deletedIds.has(id)) {
+                  storeState.deletedOfferIds = storeState.deletedOfferIds.filter((d) => d !== id);
+                }
+                indexById.set(id, storeState.offers.length);
+                storeState.offers.push(item);
+                addedOffers += 1;
+                changed = true;
+              }
+            } else {
+              const localItem = storeState.offers[existingIdx];
+              const remoteMs = parseTimestampMs(item.updatedAt);
+              const localMs = parseTimestampMs(localItem?.updatedAt);
+              if (remoteMs > localMs) {
+                storeState.offers[existingIdx] = item;
+                changed = true;
+              }
+            }
+          }
+        }
       }
 
-      const snapshot: CatalogSnapshot = {
-        settings: nextSettings,
-        batches: nextBatches,
-        offers: nextOffers,
-        updatedAt: Date.now(),
-      };
-      saveCatalogCache(snapshot);
-      res.json({
-        ok: true,
-        source: 'live',
-        settings: snapshot.settings,
-        batches: snapshot.batches,
-        offers: snapshot.offers,
-      });
-    } catch {
-      if (catalogCache) {
-        res.json({
-          ok: true,
-          source: 'stale-cache',
-          settings: catalogCache.settings,
-          batches: catalogCache.batches,
-          offers: catalogCache.offers,
-        });
-        return;
+      if (batchesRes.ok && offersRes.ok) {
+        if (!storeState.firestoreSynced) {
+          storeState.firestoreSynced = true;
+          changed = true;
+        }
       }
-      res.status(503).json({ ok: false, error: 'Failed to load catalog.' });
+
+      if (changed) persistStore();
+      return {
+        synced: storeState.firestoreSynced,
+        quotaExceeded: false,
+        addedBatches,
+        addedOffers,
+      };
+    } catch {
+      return { synced: storeState.firestoreSynced, quotaExceeded: lastFirestoreQuotaBlocked, addedBatches: 0, addedOffers: 0 };
     }
+  };
+
+  app.get('/api/public-catalog', async (req, res) => {
+    const ip = getClientIp(req);
+    const rate = checkRateBucket(`cat:${ip}`, 60_000, 180);
+    if (!rate.allowed) {
+      res.status(429).json({ error: `Rate limit exceeded. Retry in ${rate.retryAfterSec}s.` });
+      return;
+    }
+
+    await trySyncFromFirestoreIfNeeded(false);
+
+    res.json({
+      ok: true,
+      source: 'server',
+      firestoreSynced: storeState.firestoreSynced,
+      firestoreQuotaBlocked: lastFirestoreQuotaBlocked,
+      deletedBatchIds: storeState.deletedBatchIds,
+      deletedOfferIds: storeState.deletedOfferIds,
+      settings: storeState.settings,
+      batches: storeState.batches,
+      offers: storeState.offers,
+    });
+  });
+
+  app.post('/api/batches/:batchId/free-access', (req, res) => {
+    const ip = getClientIp(req);
+    const rate = checkRateBucket(`free:${ip}`, 60_000, 90);
+    if (!rate.allowed) {
+      res.status(429).json({ error: `Rate limit exceeded. Retry in ${rate.retryAfterSec}s.` });
+      return;
+    }
+    const batchId = String(req.params.batchId || '').trim();
+    const batch = storeState.batches.find((b) => String(b.id) === batchId);
+    if (!batch || batch.isActive === false) {
+      res.status(404).json({ ok: false, error: 'Batch not found or inactive.' });
+      return;
+    }
+    const isFree = batch.requirePayment === false || Number(batch.price || 0) === 0;
+    if (!isFree) {
+      res.status(403).json({ ok: false, error: 'Payment required for this batch.' });
+      return;
+    }
+    const secret = storeState.batchSecrets[batchId] || { targetUrl: '', accessInstructions: '' };
+    const openType = (batch.openType as string) || 'webview';
+    const rawUrl = secret.targetUrl || '';
+    let sealedFramePath = '';
+    if (openType === 'webview' && rawUrl) {
+      const safeUrl = isSafePublicHttpUrl(rawUrl);
+      if (safeUrl) {
+        const token = sealWebViewToken(safeUrl, req.get('user-agent') || '');
+        sealedFramePath = `/wv/open?t=${encodeURIComponent(token)}`;
+      }
+    }
+    res.json({
+      ok: true,
+      openType,
+      unlockedUrl: rawUrl,
+      unlockedInstructions: secret.accessInstructions || '',
+      sealedFramePath,
+    });
+  });
+
+  app.post('/api/orders', (req, res) => {
+    const ip = getClientIp(req);
+    const rate = checkRateBucket(`ord:${ip}`, 60_000, 30);
+    if (!rate.allowed) {
+      res.status(429).json({ error: `Rate limit exceeded. Retry in ${rate.retryAfterSec}s.` });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const batchId = typeof body.batchId === 'string' ? body.batchId.trim() : '';
+    const studentName = typeof body.studentName === 'string' ? body.studentName.trim().slice(0, 100) : '';
+    const studentPhone = typeof body.studentPhone === 'string' ? body.studentPhone.trim().slice(0, 30) : '';
+    const utrNumber = typeof body.utrNumber === 'string' ? body.utrNumber.trim().slice(0, 100) : '';
+    const paymentMethod = typeof body.paymentMethod === 'string' ? body.paymentMethod.trim().slice(0, 60) : 'UPI QR Scan';
+
+    if (!batchId || !studentName || studentPhone.length < 5 || !utrNumber) {
+      res.status(400).json({ ok: false, error: 'Please fill Name, Phone, and UTR number.' });
+      return;
+    }
+
+    const batch = storeState.batches.find((b) => String(b.id) === batchId);
+    if (!batch || batch.isActive === false) {
+      res.status(404).json({ ok: false, error: 'Selected batch is not available.' });
+      return;
+    }
+
+    const basePrice = Math.max(0, Number(batch.price) || 0);
+    const plan2Price =
+      typeof batch.plan2Price === 'number' ? Math.max(0, batch.plan2Price) : basePrice + 10;
+    const plan3Price =
+      typeof batch.plan3Price === 'number' ? Math.max(0, batch.plan3Price) : basePrice + 20;
+    const submittedAmount = Number(body.amount);
+
+    if (
+      !Number.isFinite(submittedAmount) ||
+      ![basePrice, plan2Price, plan3Price].includes(submittedAmount)
+    ) {
+      res.status(400).json({ ok: false, error: 'Selected plan amount does not match batch pricing.' });
+      return;
+    }
+
+    const orderId = `ord_${crypto.randomUUID().replace(/-/g, '')}`;
+    const nowIso = new Date().toISOString();
+    const orderRecord: Record<string, unknown> = {
+      id: orderId,
+      userId:
+        typeof body.userId === 'string' && /^[a-zA-Z0-9_-]{8,128}$/.test(body.userId)
+          ? body.userId
+          : `stu_${crypto.randomUUID().replace(/-/g, '')}`,
+      userEmail: typeof body.userEmail === 'string' ? body.userEmail.trim().slice(0, 160) : '',
+      studentName,
+      studentPhone,
+      batchId,
+      batchTitle: String(batch.title || '').slice(0, 140),
+      planLabel: typeof body.planLabel === 'string' ? body.planLabel.trim().slice(0, 60) : '1 Year',
+      amount: submittedAmount,
+      paymentMethod: paymentMethod || 'UPI QR Scan',
+      utrNumber,
+      screenshotUrl:
+        typeof body.screenshotUrl === 'string' ? body.screenshotUrl.slice(0, 500000) : '',
+      studentNote: typeof body.studentNote === 'string' ? body.studentNote.trim().slice(0, 500) : '',
+      status: 'pending',
+      adminNote: '',
+      openType: batch.openType || 'webview',
+      unlockedUrl: '',
+      unlockedInstructions: '',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    storeState.orders.unshift(orderRecord);
+    if (storeState.orders.length > 500) {
+      storeState.orders = storeState.orders.slice(0, 500);
+    }
+    persistStore();
+    res.json({ ok: true, order: orderRecord });
+  });
+
+  app.post('/api/orders/status', (req, res) => {
+    const rawIds: unknown[] = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
+    const safeIds = rawIds
+      .filter((id: unknown): id is string => typeof id === 'string' && /^ord_[a-zA-Z0-9_-]{20,128}$/.test(id))
+      .slice(0, 15);
+    if (safeIds.length === 0) {
+      res.json({ ok: true, orders: [] });
+      return;
+    }
+    const idSet = new Set(safeIds);
+    const ua = req.get('user-agent') || '';
+    const matched = storeState.orders
+      .filter((o) => idSet.has(String(o.id || '')))
+      .map((o) => {
+        if (o.status === 'approved' && o.openType === 'webview' && typeof o.unlockedUrl === 'string' && o.unlockedUrl) {
+          const safeUrl = isSafePublicHttpUrl(o.unlockedUrl);
+          if (safeUrl) {
+            const token = sealWebViewToken(safeUrl, ua);
+            return { ...o, sealedFramePath: `/wv/open?t=${encodeURIComponent(token)}` };
+          }
+        }
+        return o;
+      });
+    res.json({ ok: true, orders: matched });
+  });
+
+  // Admin full-control endpoints (protected by verified HMAC Admin session)
+  app.get('/api/admin/bootstrap', requireAdminSession, async (_req, res) => {
+    await trySyncFromFirestoreIfNeeded(false);
+    res.json({
+      ok: true,
+      firestoreSynced: storeState.firestoreSynced,
+      settings: storeState.settings,
+      batches: storeState.batches,
+      batchSecrets: storeState.batchSecrets,
+      offers: storeState.offers,
+      orders: storeState.orders,
+    });
+  });
+
+  app.post('/api/admin/sync-firestore', requireAdminSession, async (_req, res) => {
+    const result = await trySyncFromFirestoreIfNeeded(true);
+    res.json({
+      ok: true,
+      ...result,
+      settings: storeState.settings,
+      batches: storeState.batches,
+      offers: storeState.offers,
+    });
+  });
+
+  app.post('/api/admin/merge-cache', requireAdminSession, (req, res) => {
+    const body = (req.body ?? {}) as {
+      settings?: Record<string, unknown> | null;
+      batches?: Record<string, unknown>[];
+      offers?: Record<string, unknown>[];
+      batchSecrets?: Record<string, { targetUrl?: string; accessInstructions?: string }>;
+    };
+    let changed = false;
+
+    if (!storeState.settings && body.settings && typeof body.settings === 'object') {
+      storeState.settings = { ...body.settings };
+      changed = true;
+    }
+
+    if (Array.isArray(body.batches)) {
+      const existingIds = new Set(storeState.batches.map((b) => String(b.id || '')));
+      const deletedIds = new Set(storeState.deletedBatchIds);
+      for (const b of body.batches.slice(0, 100)) {
+        const id = typeof b?.id === 'string' ? b.id.trim() : '';
+        if (!id || existingIds.has(id) || deletedIds.has(id)) continue;
+        const copy: Record<string, unknown> = { ...b, id };
+        delete copy.targetUrl;
+        delete copy.accessInstructions;
+        storeState.batches.push(copy);
+        existingIds.add(id);
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(body.offers)) {
+      const existingOfferIds = new Set(storeState.offers.map((o) => String(o.id || '')));
+      const deletedOfferIds = new Set(storeState.deletedOfferIds);
+      for (const o of body.offers.slice(0, 50)) {
+        const id = typeof o?.id === 'string' ? o.id.trim() : '';
+        if (!id || existingOfferIds.has(id) || deletedOfferIds.has(id)) continue;
+        storeState.offers.push({ ...o, id });
+        existingOfferIds.add(id);
+        changed = true;
+      }
+    }
+
+    if (body.batchSecrets && typeof body.batchSecrets === 'object') {
+      for (const [id, secret] of Object.entries(body.batchSecrets)) {
+        if (!storeState.batchSecrets[id] && secret && typeof secret.targetUrl === 'string' && secret.targetUrl.trim()) {
+          storeState.batchSecrets[id] = {
+            targetUrl: secret.targetUrl.trim().slice(0, 1000),
+            accessInstructions:
+              typeof secret.accessInstructions === 'string'
+                ? secret.accessInstructions.trim().slice(0, 1000)
+                : '',
+            updatedAt: new Date().toISOString(),
+          };
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) persistStore();
+    res.json({
+      ok: true,
+      merged: changed,
+      settings: storeState.settings,
+      batches: storeState.batches,
+      batchSecrets: storeState.batchSecrets,
+      offers: storeState.offers,
+    });
+  });
+
+  app.post('/api/admin/batches', requireAdminSession, (req, res) => {
+    const body = (req.body ?? {}) as {
+      batch?: Record<string, unknown>;
+      targetUrl?: string;
+      accessInstructions?: string;
+    };
+    const b = body.batch;
+    if (!b || typeof b.id !== 'string' || !b.id.trim() || typeof b.title !== 'string' || !b.title.trim()) {
+      res.status(400).json({ ok: false, error: 'Valid batch ID and title are required.' });
+      return;
+    }
+    const batchId = b.id.trim().slice(0, 128);
+    const targetUrl = typeof body.targetUrl === 'string' ? body.targetUrl.trim().slice(0, 1000) : '';
+    const accessInstructions =
+      typeof body.accessInstructions === 'string'
+        ? body.accessInstructions.trim().slice(0, 1000)
+        : '';
+
+    const cleanBatch: Record<string, unknown> = { ...b, id: batchId };
+    delete cleanBatch.targetUrl;
+    delete cleanBatch.accessInstructions;
+    cleanBatch.updatedAt = new Date().toISOString();
+    if (!cleanBatch.createdAt) {
+      cleanBatch.createdAt = cleanBatch.updatedAt;
+    }
+
+    storeState.deletedBatchIds = storeState.deletedBatchIds.filter((id) => id !== batchId);
+
+    const idx = storeState.batches.findIndex((item) => String(item.id) === batchId);
+    if (idx >= 0) {
+      storeState.batches[idx] = cleanBatch;
+    } else {
+      storeState.batches.push(cleanBatch);
+    }
+
+    if (targetUrl) {
+      storeState.batchSecrets[batchId] = {
+        targetUrl,
+        accessInstructions,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    persistStore();
+    res.json({ ok: true, batch: cleanBatch, batches: storeState.batches });
+  });
+
+  app.delete('/api/admin/batches/:batchId', requireAdminSession, (req, res) => {
+    const batchId = String(req.params.batchId || '').trim();
+    storeState.batches = storeState.batches.filter((b) => String(b.id) !== batchId);
+    delete storeState.batchSecrets[batchId];
+    if (batchId && !storeState.deletedBatchIds.includes(batchId)) {
+      storeState.deletedBatchIds = [batchId, ...storeState.deletedBatchIds].slice(0, 200);
+    }
+    persistStore();
+    res.json({ ok: true, batches: storeState.batches });
+  });
+
+  app.post('/api/admin/offers', requireAdminSession, (req, res) => {
+    const offer = (req.body ?? {}).offer as Record<string, unknown> | undefined;
+    if (!offer || typeof offer.id !== 'string' || !offer.id.trim() || typeof offer.title !== 'string' || !offer.title.trim()) {
+      res.status(400).json({ ok: false, error: 'Valid offer ID and title are required.' });
+      return;
+    }
+    const offerId = offer.id.trim().slice(0, 128);
+    const cleanOffer: Record<string, unknown> = {
+      ...offer,
+      id: offerId,
+      updatedAt: new Date().toISOString(),
+    };
+    if (!cleanOffer.createdAt) cleanOffer.createdAt = cleanOffer.updatedAt;
+
+    storeState.deletedOfferIds = storeState.deletedOfferIds.filter((id) => id !== offerId);
+
+    const idx = storeState.offers.findIndex((item) => String(item.id) === offerId);
+    if (idx >= 0) {
+      storeState.offers[idx] = cleanOffer;
+    } else {
+      storeState.offers.push(cleanOffer);
+    }
+    persistStore();
+    res.json({ ok: true, offer: cleanOffer, offers: storeState.offers });
+  });
+
+  app.delete('/api/admin/offers/:offerId', requireAdminSession, (req, res) => {
+    const offerId = String(req.params.offerId || '').trim();
+    storeState.offers = storeState.offers.filter((o) => String(o.id) !== offerId);
+    if (offerId && !storeState.deletedOfferIds.includes(offerId)) {
+      storeState.deletedOfferIds = [offerId, ...storeState.deletedOfferIds].slice(0, 200);
+    }
+    persistStore();
+    res.json({ ok: true, offers: storeState.offers });
+  });
+
+  app.post('/api/admin/orders/:orderId/decision', requireAdminSession, (req, res) => {
+    const orderId = String(req.params.orderId || '').trim();
+    const status = req.body?.status === 'approved' ? 'approved' : req.body?.status === 'rejected' ? 'rejected' : '';
+    const adminNote = typeof req.body?.adminNote === 'string' ? req.body.adminNote.trim().slice(0, 500) : '';
+    const clientOrder = req.body?.order && typeof req.body.order === 'object' ? (req.body.order as Record<string, unknown>) : null;
+    if (!status) {
+      res.status(400).json({ ok: false, error: 'Invalid decision status.' });
+      return;
+    }
+    const idx = storeState.orders.findIndex((o) => String(o.id) === orderId);
+    const existing = idx >= 0 ? storeState.orders[idx] : clientOrder ? { ...clientOrder, id: orderId } : null;
+    if (!existing) {
+      res.status(404).json({ ok: false, error: 'Order not found.' });
+      return;
+    }
+    const batchId = String(existing.batchId || '');
+    const batch = storeState.batches.find((b) => String(b.id) === batchId);
+    const secret = storeState.batchSecrets[batchId] || { targetUrl: '', accessInstructions: '' };
+    const resolvedTargetUrl =
+      String(secret.targetUrl || '').trim() ||
+      (typeof req.body?.unlockedUrl === 'string' ? req.body.unlockedUrl.trim() : '');
+    const resolvedInstructions =
+      String(secret.accessInstructions || '').trim() ||
+      (typeof req.body?.unlockedInstructions === 'string' ? req.body.unlockedInstructions.trim() : '');
+
+    const updated: Record<string, unknown> = {
+      ...existing,
+      status,
+      adminNote:
+        adminNote ||
+        (status === 'approved'
+          ? 'Verified & Approved'
+          : 'Payment UTR could not be verified. Contact support.'),
+      openType: batch?.openType || existing.openType || 'webview',
+      unlockedUrl: status === 'approved' ? resolvedTargetUrl.slice(0, 1000) : '',
+      unlockedInstructions:
+        status === 'approved'
+          ? (resolvedInstructions ||
+              'Approved by Admin. Click the launch button below to access your batch.').slice(0, 1000)
+          : '',
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (idx >= 0) {
+      storeState.orders[idx] = updated;
+    } else {
+      storeState.orders.unshift(updated);
+      if (storeState.orders.length > 500) {
+        storeState.orders = storeState.orders.slice(0, 500);
+      }
+    }
+    persistStore();
+    res.json({ ok: true, order: updated, orders: storeState.orders });
+  });
+
+  app.post('/api/admin/sync-orders', requireAdminSession, (req, res) => {
+    const incoming = Array.isArray(req.body?.orders) ? (req.body.orders as Record<string, unknown>[]) : [];
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const o of storeState.orders) {
+      const id = String(o?.id || '');
+      if (id) byId.set(id, o);
+    }
+    let changed = false;
+    for (const ord of incoming.slice(0, 250)) {
+      const id = String(ord?.id || '');
+      if (!id) continue;
+      const existing = byId.get(id);
+      if (!existing) {
+        byId.set(id, { ...ord, id });
+        changed = true;
+      } else {
+        const remoteMs = parseTimestampMs(ord.updatedAt);
+        const localMs = parseTimestampMs(existing.updatedAt);
+        if (remoteMs > localMs) {
+          byId.set(id, { ...existing, ...ord, id });
+          changed = true;
+        }
+      }
+    }
+    const merged = Array.from(byId.values())
+      .sort((a, b) => parseTimestampMs(b.createdAt) - parseTimestampMs(a.createdAt))
+      .slice(0, 500);
+    if (changed) {
+      storeState.orders = merged;
+      persistStore();
+    }
+    res.json({ ok: true, orders: storeState.orders });
+  });
+
+  app.post('/api/admin/settings', requireAdminSession, (req, res) => {
+    const nextSettings = (req.body ?? {}).settings as Record<string, unknown> | undefined;
+    if (!nextSettings || typeof nextSettings !== 'object') {
+      res.status(400).json({ ok: false, error: 'Valid settings object required.' });
+      return;
+    }
+    storeState.settings = {
+      ...nextSettings,
+      updatedAt: new Date().toISOString(),
+    };
+    persistStore();
+    res.json({ ok: true, settings: storeState.settings });
   });
 
   app.post('/api/admin/catalog-snapshot', requireAdminSession, (req, res) => {
@@ -716,28 +1380,21 @@ async function startServer() {
       batches?: Record<string, unknown>[];
       offers?: Record<string, unknown>[];
     };
-    const safeBatches = Array.isArray(body.batches)
-      ? body.batches.slice(0, 100).map((b) => {
-          const copy = { ...b };
-          delete copy.targetUrl;
-          delete copy.accessInstructions;
-          return copy;
-        })
-      : (catalogCache?.batches ?? []);
-    const safeOffers = Array.isArray(body.offers)
-      ? body.offers.slice(0, 50)
-      : (catalogCache?.offers ?? []);
-    const safeSettings =
-      body.settings && typeof body.settings === 'object'
-        ? { ...body.settings }
-        : (catalogCache?.settings ?? null);
-
-    saveCatalogCache({
-      settings: safeSettings,
-      batches: safeBatches,
-      offers: safeOffers,
-      updatedAt: Date.now(),
-    });
+    if (Array.isArray(body.batches)) {
+      storeState.batches = body.batches.slice(0, 100).map((b) => {
+        const copy = { ...b };
+        delete copy.targetUrl;
+        delete copy.accessInstructions;
+        return copy;
+      });
+    }
+    if (Array.isArray(body.offers)) {
+      storeState.offers = body.offers.slice(0, 50);
+    }
+    if (body.settings && typeof body.settings === 'object') {
+      storeState.settings = { ...body.settings };
+    }
+    persistStore();
     res.json({ ok: true });
   });
 
@@ -1017,14 +1674,10 @@ Brand: KHATU SHYAM LEARNING`,
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
 
-    const candidateHosts = [
-      req.get('host'),
-      req.get('x-forwarded-host')?.split(',')[0]?.trim(),
-      ...AUTHORIZED_CUSTOM_HOSTS,
-    ].filter((h): h is string => Boolean(h));
+    const candidateHosts = getRequestCandidateHosts(req);
 
     const referer = req.get('referer');
-    const hasSameHostReferer = Boolean(referer && candidateHosts.some((h) => isHostMatch(referer, h)));
+    const hasSameHostReferer = Boolean(referer && isAuthorizedAppUrl(referer, candidateHosts));
     if (referer && !hasSameHostReferer) {
       res.status(403).type('html').send('<!doctype html><html><body style="background:#030307;color:#f472b6;font-family:sans-serif;text-align:center;padding:48px">Invalid request origin.</body></html>');
       return;

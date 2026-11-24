@@ -3,13 +3,13 @@ import { GlowTheme } from '../types';
 
 const THEME_RING: Record<GlowTheme, string> = {
   amber:
-    'bg-gradient-to-br from-lime-300 via-emerald-400 to-teal-400 text-zinc-950 ring-2 ring-lime-200/80 shadow-[0_0_28px_rgba(74,222,128,0.95),0_0_48px_rgba(244,114,182,0.5)]',
+    'bg-gradient-to-br from-emerald-400 to-lime-300 text-zinc-950 ring-2 ring-amber-200/80 shadow-[0_0_16px_rgba(74,222,128,0.75)]',
   crimson:
-    'bg-gradient-to-br from-pink-300 via-pink-500 to-fuchsia-500 text-white ring-2 ring-pink-200/80 shadow-[0_0_28px_rgba(244,114,182,0.95)]',
+    'bg-gradient-to-br from-pink-400 to-rose-400 text-zinc-950 ring-2 ring-pink-200/80 shadow-[0_0_16px_rgba(244,114,182,0.75)]',
   sapphire:
-    'bg-gradient-to-br from-cyan-300 via-sky-400 to-blue-500 text-zinc-950 ring-2 ring-cyan-200/80 shadow-[0_0_28px_rgba(56,189,248,0.95)]',
+    'bg-gradient-to-br from-cyan-300 to-sky-400 text-zinc-950 ring-2 ring-cyan-200/80 shadow-[0_0_16px_rgba(56,189,248,0.75)]',
   emerald:
-    'bg-gradient-to-br from-lime-300 via-green-400 to-emerald-500 text-zinc-950 ring-2 ring-lime-200/80 shadow-[0_0_28px_rgba(74,222,128,0.95)]',
+    'bg-gradient-to-br from-lime-300 to-emerald-400 text-zinc-950 ring-2 ring-lime-200/80 shadow-[0_0_16px_rgba(74,222,128,0.8)]',
 };
 
 export function VerifiedMark({

@@ -79,6 +79,7 @@ export interface Order {
   openType: OpenType;
   unlockedUrl: string;
   unlockedInstructions: string;
+  sealedFramePath?: string;
   createdAt?: unknown;
   updatedAt?: unknown;
 }

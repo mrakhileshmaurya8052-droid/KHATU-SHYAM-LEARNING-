@@ -36,6 +36,7 @@ function createFirestoreInstance(): Firestore {
 export const db = createFirestoreInstance();
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 export const BOOTSTRAPPED_ADMIN_EMAIL = 'mrakhileshmaurya8052@gmail.com';
 export const FIRESTORE_UPGRADE_URL = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`;

@@ -55,6 +55,11 @@ export function writeCachedCatalog(partial: {
       localStorage.setItem(KEY_OFFERS, JSON.stringify(partial.offers));
     }
     localStorage.setItem(KEY_TS, String(Date.now()));
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel('ksl_catalog_sync');
+      ch.postMessage({ ts: Date.now() });
+      ch.close();
+    }
   } catch {
     // Ignore localStorage quota restrictions cleanly
   }

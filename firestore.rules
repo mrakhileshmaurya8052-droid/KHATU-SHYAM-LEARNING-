@@ -67,7 +67,7 @@ service cloud.firestore {
       && data.paymentInstructions is string && data.paymentInstructions.size() <= 600
       && data.gatewayPaymentUrl is string && data.gatewayPaymentUrl.size() <= 500
       && data.supportTelegramUrl is string && data.supportTelegramUrl.size() <= 300
-      && data.supportWhatsapp is string && data.supportWhatsapp.size() <= 40
+      && data.supportWhatsapp is string && data.supportWhatsapp.size() <= 300
       && data.supportedMethods is list && data.supportedMethods.size() <= 10
       && (data.supportedMethods.size() == 0 || data.supportedMethods[0] is string)
       && (!('customDomain' in data) || (data.customDomain is string && data.customDomain.size() <= 180))

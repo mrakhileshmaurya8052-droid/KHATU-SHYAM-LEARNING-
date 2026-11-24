@@ -80,8 +80,8 @@
         },
         "supportWhatsapp": {
           "type": "string",
-          "maxLength": 40,
-          "description": "Support WhatsApp number or link."
+          "maxLength": 300,
+          "description": "Support WhatsApp number or channel link."
         },
         "supportedMethods": {
           "type": "array",

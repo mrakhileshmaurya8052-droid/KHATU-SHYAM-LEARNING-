@@ -18,7 +18,7 @@ export const DEFAULT_SITE_SETTINGS: SiteSettings = {
     'Scan the QR code or use any supported UPI app below. After paying, submit your 12-digit UTR number in the verification form for Admin approval.',
   gatewayPaymentUrl: '',
   supportTelegramUrl: 'https://t.me/Cheatestbatchwallah',
-  supportWhatsapp: '',
+  supportWhatsapp: 'https://whatsapp.com/channel/0029Vb7xXWZ7dmedUxP4PY44',
   supportedMethods: ['upi_qr', 'phonepe', 'gpay', 'paytm', 'bhim', 'bank_transfer'],
   customDomain: 'khatushyamlearning.vercel.app',
 };
